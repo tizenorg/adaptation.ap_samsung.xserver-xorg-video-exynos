@@ -3,7 +3,7 @@
 
 Name:       xorg-x11-drv-exynos
 Summary:    X.Org X server driver for exynos
-Version:    0.2.79
+Version:    0.2.93
 Release:    1
 ExclusiveArch:  %arm
 Group:      System/X Hardware Support
