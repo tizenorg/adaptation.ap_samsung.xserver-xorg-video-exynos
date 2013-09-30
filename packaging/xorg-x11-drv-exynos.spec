@@ -27,11 +27,14 @@ make %{?jobs:-j%jobs}
 
 %install
 rm -rf %{buildroot}
+mkdir -p %{buildroot}/usr/share/license
+cp -af COPYING %{buildroot}/usr/share/license/%{name}
 %make_install
 
 execstack -c %{buildroot}%{_libdir}/xorg/modules/drivers/exynos_drv.so
 
 %files
 %defattr(-,root,root,-)
+/usr/share/license/%{name}
 %{_libdir}/xorg/modules/drivers/*.so
 
