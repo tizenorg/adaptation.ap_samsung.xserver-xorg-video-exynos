@@ -42,7 +42,7 @@ rm -rf %{buildroot}
 # >> build pre
 # << build pre
 
-%if %{_repository} == "wearable" 
+%if %{?tizen_profile_name} == "wearable" 
 export CFLAGS+=" -D_F_WEARABLE_PROFILE_ "
 %endif
 
