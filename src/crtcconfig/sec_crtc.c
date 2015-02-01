@@ -1906,7 +1906,7 @@ Bool
 secCrtcCursorEnable (ScrnInfoPtr pScrn, Bool enable)
 {
     SECModePtr pSecMode = (SECModePtr) SECPTR (pScrn)->pSecMode;
-    SECCrtcPrivPtr pCur, pNext;
+    SECCrtcPrivPtr pCur = NULL, pNext = NULL;
 
     xorg_list_for_each_entry_safe (pCur, pNext, &pSecMode->crtcs, link)
     {

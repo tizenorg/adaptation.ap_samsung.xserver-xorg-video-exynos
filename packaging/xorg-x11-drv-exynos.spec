@@ -14,7 +14,6 @@ Source0:    %{name}-%{version}.tar.gz
 BuildRequires:  prelink
 BuildRequires:  xorg-x11-xutils-dev
 BuildRequires:  pkgconfig(xorg-server)
-BuildRequires:  pkgconfig(x11)
 BuildRequires:  pkgconfig(xproto)
 BuildRequires:  pkgconfig(fontsproto)
 BuildRequires:  pkgconfig(randrproto)
@@ -42,7 +41,7 @@ rm -rf %{buildroot}
 # >> build pre
 # << build pre
 
-%if %{_repository} == "wearable" 
+%if %{?tizen_profile_name} == "wearable" 
 export CFLAGS+=" -D_F_WEARABLE_PROFILE_ "
 %endif
 

@@ -244,8 +244,8 @@ ExaBox* _g2dBoxAdd (struct xorg_list *l, BoxPtr b1, BoxPtr b2)
 
 void _g2dBoxMerge (struct xorg_list *l, struct xorg_list* b, struct xorg_list* t)
 {
-    ExaBox *b1, *b2;
-    ExaBox* r=NULL;
+    ExaBox *b1 = NULL, *b2 = NULL;
+    ExaBox* r = NULL;
 
     xorg_list_for_each_entry (b1, b, link)
     {
@@ -264,7 +264,7 @@ void _g2dBoxMerge (struct xorg_list *l, struct xorg_list* b, struct xorg_list* t
 
 void _g2dBoxMove (struct xorg_list* l, int tx, int ty)
 {
-    ExaBox *b;
+    ExaBox *b = NULL;
 
     xorg_list_for_each_entry (b, l, link)
     {
@@ -274,7 +274,7 @@ void _g2dBoxMove (struct xorg_list* l, int tx, int ty)
 
 void _g2dBoxRemoveAll (struct xorg_list* l)
 {
-    ExaBox *ref, *next;
+    ExaBox *ref = NULL, *next = NULL;
 
     xorg_list_for_each_entry_safe (ref, next, l, link)
     {
@@ -298,7 +298,7 @@ int _g2dBoxIsOne (struct xorg_list* l)
 
 void _g2dBoxPrint (ExaBox* sb1, const char* name)
 {
-    ExaBox *b;
+    ExaBox *b = NULL;
 
     xorg_list_for_each_entry (b, &sb1->link, link)
     {
@@ -468,7 +468,7 @@ static ExaOpInfo* _g2dPrepareAccess (PixmapPtr pPix, int index, unsigned int dev
     ExaOpInfo* op = &OpInfo[index];
     int opt = TBM_OPTION_READ;
     int i;
-    tbm_bo *bos;
+    tbm_bo *bos = NULL;
     tbm_bo_handle bo_handle;
     SECFbBoDataPtr bo_data;
     int num_bo;
@@ -550,10 +550,9 @@ static ExaOpInfo* _g2dPrepareAccess (PixmapPtr pPix, int index, unsigned int dev
                                                                                                 op->buf[i].access_data);
                 }
             }
-
-            if (bos)
-                free (bos);
         }
+        if (bos)
+            free (bos);
     }
     else
     {
@@ -644,7 +643,7 @@ static void _g2dFinishAccess (PixmapPtr pPix, int index)
 void
 _g2dDoDraw (struct xorg_list *l, DoDrawProcPtrEx do_draw, void* data)
 {
-    ExaBox *box;
+    ExaBox *box = NULL;
     xorg_list_for_each_entry (box, l, link)
     {
         do_draw (box, data);

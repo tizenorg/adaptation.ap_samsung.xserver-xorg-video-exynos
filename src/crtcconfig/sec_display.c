@@ -567,21 +567,21 @@ secModeDeinit (ScrnInfoPtr pScrn)
 
     secDisplayDeinitDispMode (pScrn);
 
-    SECCrtcPrivPtr crtc_ref=NULL, crtc_next=NULL;
+    SECCrtcPrivPtr crtc_ref = NULL, crtc_next = NULL;
     xorg_list_for_each_entry_safe (crtc_ref, crtc_next, &pSecMode->crtcs, link)
     {
         pCrtc = crtc_ref->pCrtc;
         xf86CrtcDestroy (pCrtc);
     }
 
-    SECOutputPrivPtr output_ref, output_next;
+    SECOutputPrivPtr output_ref = NULL, output_next = NULL;
     xorg_list_for_each_entry_safe (output_ref, output_next, &pSecMode->outputs, link)
     {
         pOutput = output_ref->pOutput;
         xf86OutputDestroy (pOutput);
     }
 
-    SECPlanePrivPtr plane_ref, plane_next;
+    SECPlanePrivPtr plane_ref = NULL, plane_next = NULL;
     xorg_list_for_each_entry_safe (plane_ref, plane_next, &pSecMode->planes, link)
     {
         secPlaneDeinit (pScrn, plane_ref);
@@ -1636,9 +1636,8 @@ Bool secDisplayUpdateRequest(ScrnInfoPtr pScrn)
             * That means only LCD buffer is updated.
             * Frame buffer is not swapped. Because these request is only for FB_BLIT case!
             */
-            ret = drmModePageFlip (pSec->drm_fd, secCrtcID(pCrtcPriv), fb_id,
-                    DRM_MODE_PAGE_FLIP_EVENT, pPageFlip);
-            if (ret)
+            if (drmModePageFlip (pSec->drm_fd, secCrtcID(pCrtcPriv), fb_id,
+                                 DRM_MODE_PAGE_FLIP_EVENT, pPageFlip))
             {
                 XDBG_ERRNO (MDISP, "Page flip failed: %s\n", strerror (errno));
                 goto fail;
