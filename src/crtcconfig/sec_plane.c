@@ -50,7 +50,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <X11/Xatom.h>
 #include <X11/extensions/dpmsconst.h>
 #include <sec.h>
-#include <exynos_drm.h>
+#include <exynos/exynos_drm.h>
 
 #include "sec_crtc.h"
 #include "sec_output.h"
@@ -61,6 +61,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 /* HW restriction */
 #define MIN_WIDTH   32
+#define MIN_HEIGHT   4
 
 enum
 {
@@ -86,7 +87,7 @@ typedef struct _SECPlaneAccess
 /* This is structure to manage a added buffer. */
 typedef struct _SECPlaneFb
 {
-    unsigned int id;
+    intptr_t id;
 
     int type;
     union
@@ -107,7 +108,7 @@ typedef struct _SECPlaneFb
 typedef struct _SECPlaneTable
 {
     SECPlanePrivPtr pPlanePriv;
-    int plane_id;
+    intptr_t plane_id;
 
     /* buffers which this plane has */
     struct xorg_list  fbs;
@@ -134,25 +135,26 @@ static SECPlaneTable *plane_table;
 static int plane_table_size;
 
 static SECPlaneTable* _secPlaneTableFind (int plane_id);
-static SECPlaneFb* _secPlaneTableFindBuffer (SECPlaneTable *table, int fb_id,
+static SECPlaneFb* _secPlaneTableFindBuffer (SECPlaneTable *table, intptr_t fb_id,
                                              tbm_bo bo, SECVideoBuf *vbuf);
 static Bool _secPlaneHideInternal (SECPlaneTable *table);
+static void _secPlaneTableFreeBuffer (SECPlaneTable *table, SECPlaneFb *fb);
 
 static void
 _secPlaneFreeVbuf (SECVideoBuf *vbuf, void *data)
 {
-    int plane_id = (int)data;
+    intptr_t plane_id = (intptr_t)data;
     SECPlaneTable *table;
     SECPlaneFb *fb;
 
     table = _secPlaneTableFind (plane_id);
     XDBG_RETURN_IF_FAIL (table != NULL);
 
-    fb = _secPlaneTableFindBuffer (table, vbuf->fb_id, NULL, NULL);
+    fb = _secPlaneTableFindBuffer (table, 0, NULL, vbuf);
     XDBG_RETURN_IF_FAIL (fb != NULL);
 
     fb->buffer_gone = TRUE;
-    secPlaneRemoveBuffer (plane_id, vbuf->fb_id);
+    _secPlaneTableFreeBuffer (table, fb);
 }
 
 static SECPlaneTable*
@@ -199,7 +201,7 @@ _secPlaneTableFindEmpty (void)
 
 static SECPlaneFb*
 _secPlaneTableFindBuffer (SECPlaneTable *table,
-                          int fb_id,
+                          intptr_t fb_id,
                           tbm_bo bo,
                           SECVideoBuf *vbuf)
 {
@@ -322,79 +324,216 @@ access_done:
     if (dstImg)
         g2d_image_free (dstImg);
 }
-
 static Bool
-_check_hw_restriction (ScrnInfoPtr pScrn, int crtc_id, int buf_w,
-                       int src_x, int src_w, int dst_x, int dst_w,
-                       int *new_src_x, int *new_src_w,
-                       int *new_dst_x, int *new_dst_w)
+_alignLVDSPlane (xRectanglePtr src, xRectanglePtr dst,
+                 xRectanglePtr aligned_src, xRectanglePtr aligned_dst,
+                 int buf_w, int buf_h, int disp_w, int disp_h)
 {
-    SECOutputPrivPtr pOutputPriv = secOutputGetPrivateForConnType (pScrn, DRM_MODE_CONNECTOR_LVDS);
-    SECModePtr pSecMode = (SECModePtr) SECPTR (pScrn)->pSecMode;
-    int max = pSecMode->main_lcd_mode.hdisplay;
-    int start, end, diff;
-    Bool virtual_screen;
+    Bool ret = TRUE;
+    aligned_dst->x = dst->x;
+    aligned_dst->y = dst->y;
+    aligned_dst->width = dst->width & (~0x1);
+    aligned_dst->height = dst->height;
+    aligned_src->x = src->x < 0 ? 0 : src->x;
+    aligned_src->y = src->y < 0 ? 0 : src->y;
 
-    XDBG_RETURN_VAL_IF_FAIL (pOutputPriv != NULL, FALSE);
 
-    if (pOutputPriv->mode_encoder->crtc_id != crtc_id)
-        return TRUE;
-
-    if (buf_w < MIN_WIDTH || buf_w % 2)
+    if ((aligned_src->x + src->width > buf_w) || (aligned_src->y + src->height > buf_h))
     {
-        XDBG_TRACE (MPLN, "hide: buf_w(%d) not 2's multiple or less than %d\n",
-                    buf_w, MIN_WIDTH);
+        XDBG_WARNING (MPLN, "hide: crop coord x %d y %d w %d h %d is higher than buf_w(%d) buf_h(%d)\n",
+                      aligned_src->x, src->width,
+                      aligned_src->y, src->height,
+                      buf_w, buf_h);
         return FALSE;
     }
 
-    if (src_x > dst_x || ((dst_x - src_x) + buf_w) > max)
+    aligned_src->width = src->width & (~0x1);
+    aligned_src->height = src->height;
+
+    if ((aligned_dst->width < MIN_WIDTH) || (aligned_dst->height < MIN_HEIGHT))
+    {
+        XDBG_WARNING (MPLN, "hide: %d, %d: buf_w(%d) buf_h(%d)\n",
+                      aligned_dst->width,
+                      aligned_dst->height ,
+                      buf_w, buf_h);
+        XDBG_WARNING (MPLN, "src(x%d,y%d w%d-h%d) dst(x%d,y%d w%d-h%d)\n",
+                      src->x, src->y, src->width, src->height,
+                      dst->x, dst->y, dst->width, dst->height);
+        XDBG_WARNING (MPLN,"start(x%d,y%d) end(w%d,h%d)\n",
+                      aligned_dst->x, aligned_dst->y,
+                      aligned_dst->width, aligned_dst->height);
+        ret = FALSE;
+    }
+
+    if ((aligned_src->width < MIN_WIDTH) || (aligned_src->height < MIN_HEIGHT))
+    {
+        XDBG_WARNING (MPLN, "hide: %d, %d: buf_w(%d) buf_h(%d)\n",
+                      aligned_src->width,
+                      aligned_src->height,
+                      buf_w, buf_h);
+        XDBG_WARNING (MPLN, "src(x%d,y%d w%d-h%d) dst(x%d,y%d w%d-h%d)\n",
+                      src->x, src->y, src->width, src->height,
+                      dst->x, dst->y, dst->width, dst->height);
+        XDBG_WARNING (MPLN,"start(x%d,y%d) end(w%d,h%d)\n",
+                      aligned_src->x, aligned_src->y,
+                      aligned_src->width, aligned_src->height);
+        ret = FALSE;
+    }
+
+    return ret;
+}
+
+static Bool
+_alignHDMIPlane (xRectanglePtr src, xRectanglePtr dst,
+                 xRectanglePtr aligned_src, xRectanglePtr aligned_dst,
+                 int buf_w, int buf_h, int disp_w, int disp_h)
+{
+    Bool ret = TRUE;
+    aligned_dst->x = (dst->x < 0) ? 0 : dst->x;
+    aligned_dst->y = (dst->y < 0) ? 0 : dst->y;
+    aligned_dst->width = (((aligned_dst->x + dst->width) > disp_w) ? disp_w : (dst->width)) &(~0x1);
+    aligned_dst->height = ((aligned_dst->y + dst->height) > disp_h) ? disp_h : (dst->height);
+    aligned_src->x = (src->x < 0) ? 0 : src->x;
+    aligned_src->y = (src->y < 0) ? 0 : src->y;
+    aligned_src->width = (((aligned_src->x + src->width) > disp_w) ? disp_w : (src->width)) &(~0x1);
+    aligned_src->height = ((aligned_src->y + src->height) > disp_h) ? disp_h : (src->height);
+
+    if ((aligned_dst->width < MIN_WIDTH) || (aligned_dst->height < MIN_HEIGHT))
+    {
+        XDBG_WARNING (MPLN, "hide: %d, %d: buf_w(%d) buf_h(%d)\n",
+                      aligned_dst->width,
+                      aligned_dst->height,
+                      buf_w, buf_h);
+        XDBG_WARNING (MPLN, "src(x%d,y%d w%d-h%d) dst(x%d,y%d w%d-h%d)\n",
+                      src->x, src->y, src->width, src->height,
+                      dst->x, dst->y, dst->width, dst->height);
+        XDBG_WARNING (MPLN,"start(x%d,y%d) end(w%d,h%d)\n",
+                      aligned_dst->x, aligned_dst->y,
+                      aligned_dst->width, aligned_dst->height);
+        ret = FALSE;
+    }
+
+    if ((aligned_src->width < MIN_WIDTH) || (aligned_src->height < MIN_HEIGHT))
+    {
+        XDBG_WARNING (MPLN, "hide: %d, %d: buf_w(%d) buf_h(%d)\n",
+                      aligned_src->width,
+                      aligned_src->height,
+                      buf_w, buf_h);
+        XDBG_WARNING (MPLN, "src(x%d,y%d w%d-h%d) dst(x%d,y%d w%d-h%d)\n",
+                      src->x, src->y, src->width, src->height,
+                      dst->x, dst->y, dst->width, dst->height);
+        XDBG_WARNING (MPLN,"start(x%d,y%d) end(w%d,h%d)\n",
+                      aligned_src->x, aligned_src->y,
+                      aligned_src->width, aligned_src->height);
+        ret = FALSE;
+    }
+    return ret;
+}
+
+static Bool
+_check_hw_restriction (ScrnInfoPtr pScrn, int crtc_id, int buf_w, int buf_h,
+                       xRectanglePtr src, xRectanglePtr dst,
+                       xRectanglePtr aligned_src, xRectanglePtr aligned_dst)
+{
+    /* Kernel manage CRTC status based out output config */
+    Bool ret = FALSE;
+    xf86CrtcPtr pCrtc = secCrtcGetByID(pScrn, crtc_id);
+    if (pCrtc == NULL)
+    {
+        XDBG_ERROR(MPLN, "Can't found crtc_id(%d)\n", crtc_id);
+        return ret;
+    }
+    if (!pCrtc->enabled && !pCrtc->active)
+    {
+        XDBG_ERROR(MPLN, "Current crtc_id(%d) not active\n", crtc_id);
+        return ret;
+    }
+
+    int max_w = pCrtc->mode.CrtcHDisplay;
+    int max_h = pCrtc->mode.CrtcVDisplay;
+    if (max_w == 0 || max_h == 0)
+    {
+        max_w = pScrn->virtualX;
+        max_h = pScrn->virtualY;
+    }
+    switch (secCrtcGetConnectType (pCrtc))
+    {
+        case DRM_MODE_CONNECTOR_LVDS:
+            ret = _alignLVDSPlane (src, dst, aligned_src, aligned_dst,
+                                   buf_w, buf_h, max_w, max_h);
+            break;
+        case DRM_MODE_CONNECTOR_HDMIA:
+        case DRM_MODE_CONNECTOR_HDMIB:
+            ret = _alignHDMIPlane (src, dst, aligned_src, aligned_dst,
+                                   buf_w, buf_h, max_w, max_h);
+            break;
+        default:
+            XDBG_WARNING (MPLN, "Not supported plane for current output %d\n",
+                          secCrtcGetConnectType (pCrtc));
+            break;
+    }
+
+    if (buf_w < MIN_WIDTH || buf_w % 2)
+    {
+        XDBG_WARNING (MPLN, "hide: buf_w(%d) not 2's multiple or less than %d\n",
+                    buf_w, MIN_WIDTH);
+        ret = FALSE;
+    }
+
+    if (buf_h < MIN_HEIGHT)
+    {
+        XDBG_WARNING (MPLN, "hide: buf_h(%d) less than %d\n",
+                    buf_h, MIN_HEIGHT);
+        ret = FALSE;
+    }
+#if 0
+    if (src_x > dst_x || ((dst_x - src_x) + buf_w) > max_w)
         virtual_screen = TRUE;
     else
         virtual_screen = FALSE;
 
-    start = (dst_x < 0) ? 0 : dst_x;
-    end = ((dst_x + dst_w) > max) ? max : (dst_x + dst_w);
-
-    /* check window minimun width */
-    if ((end - start) < MIN_WIDTH)
-    {
-        XDBG_TRACE (MPLN, "hide: %d than min size: buf_w(%d) src(%d,%d) dst(%d,%d), virt(%d) start(%d) end(%d)\n",
-                    end-start, buf_w, src_x, src_w, dst_x, dst_w,
-                    virtual_screen, start, end);
-        return FALSE;
-    }
-
-    XDBG_DEBUG (MPLN, "buf_w(%d) src(%d,%d) dst(%d,%d), virt(%d) start(%d) end(%d)\n",
-                buf_w, src_x, src_w, dst_x, dst_w, virtual_screen, start, end);
-
     if (!virtual_screen)
     {
         /* Pagewidth of window (= 8 byte align / bytes-per-pixel ) */
-        if ((end - start) % 2)
-            end--;
+        if ((end_dst - start_dst) % 2)
+            end_dst--;
     }
     else
     {
         /* You should align the sum of PAGEWIDTH_F and OFFSIZE_F double-word (8 byte) boundary. */
-        if (end % 2)
-            end--;
+        if (end_dst % 2)
+            end_dst--;
     }
 
-    *new_dst_x = start;
-    *new_dst_w = end - start;
-    *new_src_w = *new_dst_w;
-    diff = start - dst_x;
-    *new_src_x += diff;
+    *new_dst_x = start_dst;
+    *new_dst_w = end_dst - start_dst;
+    *new_src_w = end_src - start_src;
+//    diff = start_dst - dst_x;
+    *new_src_x = start_src;
 
     XDBG_RETURN_VAL_IF_FAIL (*new_src_w > 0, FALSE);
     XDBG_RETURN_VAL_IF_FAIL (*new_dst_w > 0, FALSE);
-
     if (src_x != *new_src_x || src_w != *new_src_w ||
         dst_x != *new_dst_x || dst_w != *new_dst_w)
         XDBG_TRACE (MPLN, " => buf_w(%d) src(%d,%d) dst(%d,%d), virt(%d) start(%d) end(%d)\n",
-                    buf_w, *new_src_x, *new_src_w, *new_dst_x, *new_dst_w, virtual_screen, start, end);
-
-    return TRUE;
+                    buf_w, *new_src_x, *new_src_w, *new_dst_x, *new_dst_w, virtual_screen, start_dst, end_dst);
+#endif
+    XDBG_TRACE (MPLN, "src(x%d,y%d w%d-h%d) dst(x%d,y%d w%d-h%d) ratio_x %f ratio_y %f\n",
+                src->x, src->y, src->width, src->height,
+                dst->x, dst->y, dst->width, dst->height,
+                (double) src->width/dst->width, (double) src->height/dst->height);
+    if (memcmp(aligned_src, src, sizeof(xRectangle))
+        || memcmp(aligned_dst, dst, sizeof(xRectangle)))
+    {
+        XDBG_TRACE(MPLN, "===> src(x%d,y%d w%d-h%d) dst(x%d,y%d w%d-h%d) ratio_x %f ratio_y %f\n",
+                   aligned_src->x, aligned_src->y,
+                   aligned_src->width, aligned_src->height,
+                   aligned_dst->x, aligned_dst->y,
+                   aligned_dst->width, aligned_dst->height,
+                   (double) aligned_src->width / aligned_dst->width,
+                   (double) aligned_src->height / aligned_dst->height);
+    }    
+    return ret;
 }
 
 static Bool
@@ -405,6 +544,11 @@ _secPlaneShowInternal (SECPlaneTable *table,
 {
     SECPtr pSec;
     SECModePtr pSecMode;
+    XDBG_RETURN_VAL_IF_FAIL(old_fb != NULL, FALSE);
+    XDBG_RETURN_VAL_IF_FAIL(new_fb != NULL, FALSE);
+    XDBG_RETURN_VAL_IF_FAIL(table != NULL, FALSE);
+    XDBG_RETURN_VAL_IF_FAIL(new_src != NULL, FALSE);
+    XDBG_RETURN_VAL_IF_FAIL(new_dst != NULL, FALSE);
     xRectangle old_src = table->src;
     xRectangle old_dst = table->dst;
     int old_zpos = table->zpos;
@@ -414,12 +558,12 @@ _secPlaneShowInternal (SECPlaneTable *table,
     pSec = SECPTR (table->pPlanePriv->pScrn);
     pSecMode = table->pPlanePriv->pSecMode;
 
-    if (pSec->isLcdOff)
-    {
-        XDBG_TRACE (MPLN, "lcd off, can't show : plane(%d) crtc(%d) pos(%d). \n",
-                    table->plane_id, table->crtc_id, new_zpos);
-        return FALSE;
-    }
+//    if (pSec->isLcdOff)
+//    {
+//        XDBG_TRACE (MPLN, "lcd off, can't show : plane(%d) crtc(%d) pos(%d). \n",
+//                    table->plane_id, table->crtc_id, new_zpos);
+//        return FALSE;
+//    }
 
     if (!table->onoff)
     {
@@ -475,21 +619,24 @@ _secPlaneShowInternal (SECPlaneTable *table,
         if (!pCrtcPriv->bAccessibility ||
             (new_fb->type == PLANE_FB_TYPE_DEFAULT && new_fb->buffer.vbuf->id != FOURCC_RGB32))
         {
+#if 0
             int aligned_src_x = new_src->x;
             int aligned_src_w = new_src->width;
             int aligned_dst_x = new_dst->x;
             int aligned_dst_w = new_dst->width;
-
+#endif
+            xRectangle aligned_src;
+            xRectangle aligned_dst;
             if (!_check_hw_restriction (table->pPlanePriv->pScrn, table->crtc_id,
-                                        table->cur_fb->width,
-                                        new_src->x, new_src->width,
-                                        new_dst->x, new_dst->width,
-                                        &aligned_src_x, &aligned_src_w,
-                                        &aligned_dst_x, &aligned_dst_w))
+                                        table->cur_fb->width, table->cur_fb->height,
+                                        new_src, new_dst,
+                                        &aligned_src, &aligned_dst))
             {
-                XDBG_TRACE (MPLN, "out of range: plane(%d) crtc(%d) pos(%d) crtc(%d,%d %dx%d). \n",
+                XDBG_TRACE (MPLN, "out of range: plane(%d) crtc(%d) pos(%d) crtc(x%d,y%d w%d-h%d)\n",
                             table->plane_id, table->crtc_id, new_zpos,
-                            aligned_dst_x, new_dst->y, aligned_dst_w, new_dst->height);
+                            new_dst->x, new_dst->y, new_dst->width, new_dst->height);
+                XDBG_TRACE (MPLN, "src(x%d,y%d w%d-h%d)\n",
+                            new_src->x, new_src->y, new_src->width, new_src->height);
 
                 _secPlaneHideInternal (table);
 
@@ -497,15 +644,17 @@ _secPlaneShowInternal (SECPlaneTable *table,
             }
 
             /* Source values are 16.16 fixed point */
-            uint32_t fixed_x = ((unsigned int)aligned_src_x) << 16;
-            uint32_t fixed_y = ((unsigned int)new_src->y) << 16;
-            uint32_t fixed_w = ((unsigned int)aligned_src_w) << 16;
-            uint32_t fixed_h = ((unsigned int)new_src->height) << 16;
+
+            uint32_t fixed_x = ((unsigned int)aligned_src.x) << 16;
+            uint32_t fixed_y = ((unsigned int)aligned_src.y) << 16;
+            uint32_t fixed_w = ((unsigned int)aligned_src.width) << 16;
+            uint32_t fixed_h = ((unsigned int)aligned_src.height) << 16;
+
 
             if (drmModeSetPlane (pSecMode->fd, table->plane_id, table->crtc_id,
                                  new_fb->id, 0,
-                                 aligned_dst_x, new_dst->y,
-                                 aligned_dst_w, new_dst->height,
+                                 aligned_dst.x, aligned_dst.y,
+                                 aligned_dst.width, aligned_dst.height,
                                  fixed_x, fixed_y,
                                  fixed_w, fixed_h))
             {
@@ -513,8 +662,8 @@ _secPlaneShowInternal (SECPlaneTable *table,
                             table->plane_id, table->crtc_id, table->zpos,
                             new_fb->id, FOURCC_STR (new_fb->buffer.vbuf->id),
                             new_fb->buffer.vbuf->width, new_fb->buffer.vbuf->height,
-                            aligned_src_x, new_src->y, aligned_src_w, new_src->height,
-                            aligned_dst_x, new_dst->y, aligned_dst_w, new_dst->height);
+                            aligned_src.x, aligned_src.y, aligned_src.width, aligned_src.height,
+                            aligned_dst.x, aligned_dst.y, aligned_dst.width, aligned_dst.height);
 
                 return FALSE;
             }
@@ -525,8 +674,8 @@ _secPlaneShowInternal (SECPlaneTable *table,
                              table->plane_id, table->crtc_id, table->zpos,
                              new_fb->id, FOURCC_STR (new_fb->buffer.vbuf->id),
                              new_fb->buffer.vbuf->width, new_fb->buffer.vbuf->height,
-                             aligned_src_x, new_src->y, aligned_src_w, new_src->height,
-                             aligned_dst_x, new_dst->y, aligned_dst_w, new_dst->height);
+                             aligned_src.x, aligned_src.y, aligned_src.width, aligned_src.height,
+                             aligned_dst.x, aligned_dst.y, aligned_dst.width, aligned_dst.height);
                 table->visible = TRUE;
             }
         }
@@ -692,22 +841,18 @@ _secPlaneShowInternal (SECPlaneTable *table,
             _secPlaneExecAccessibility (src_bo, new_fb->width, new_fb->height, &fb_src,
                                         access->bo, access->width, access->height, &access->src,
                                         pCrtcPriv->accessibility_status);
-
-            int aligned_src_x = access->src.x;
-            int aligned_src_w = access->src.width;
-            int aligned_dst_x = access->dst.x;
-            int aligned_dst_w = access->dst.width;
-
+            xRectangle aligned_src;
+            xRectangle aligned_dst;
             if (!_check_hw_restriction (table->pPlanePriv->pScrn, table->crtc_id,
-                                        access->width,
-                                        access->src.x, access->src.width,
-                                        access->dst.x, access->dst.width,
-                                        &aligned_src_x, &aligned_src_w,
-                                        &aligned_dst_x, &aligned_dst_w))
+                                        access->width, access->height,
+                                        &access->src, &access->dst,
+                                        &aligned_src, &aligned_dst))
             {
-                XDBG_TRACE (MPLN, "out of range: plane(%d) crtc(%d) pos(%d) crtc(%d,%d %dx%d). \n",
+                XDBG_TRACE (MPLN, "access : out of range: plane(%d) crtc(%d) pos(%d) crtc(x%d,y%d w%d-h%d)\n",
                             table->plane_id, table->crtc_id, new_zpos,
-                            aligned_dst_x, new_dst->y, aligned_dst_w, new_dst->height);
+                            access->dst.x, access->dst.y, access->dst.width, access->dst.height);
+                XDBG_TRACE (MPLN, "access : src(x%d,y%d w%d-h%d)\n",
+                            access->src.x, access->src.y, access->src.width, access->src.height);
 
                 _secPlaneHideInternal (table);
 
@@ -715,15 +860,19 @@ _secPlaneShowInternal (SECPlaneTable *table,
             }
 
             /* Source values are 16.16 fixed point */
-            uint32_t fixed_x = ((unsigned int)aligned_src_x) << 16;
-            uint32_t fixed_y = ((unsigned int)access->src.y) << 16;
-            uint32_t fixed_w = ((unsigned int)aligned_src_w) << 16;
-            uint32_t fixed_h = ((unsigned int)access->src.height) << 16;
+            uint32_t fixed_x = ((unsigned int)aligned_src.x) << 16;
+            uint32_t fixed_y = ((unsigned int)aligned_src.y) << 16;
+            uint32_t fixed_w = ((unsigned int)aligned_src.width) << 16;
+            uint32_t fixed_h = ((unsigned int)aligned_src.height) << 16;
+
+            XDBG_DEBUG(MPLN, "Access plane: fixed:(x%d,y%d w%d-h%d), dst:(x%d,y%d w%d-h%d)\n",
+                       aligned_src.x, aligned_src.y, aligned_src.width, aligned_src.height,
+                       aligned_dst.x, aligned_dst.y, aligned_dst.width, aligned_dst.height);
 
             if (drmModeSetPlane (pSecMode->fd, table->plane_id, table->crtc_id,
                                  access->fb_id, 0,
-                                 aligned_dst_x, access->dst.y,
-                                 aligned_dst_w, access->dst.height,
+                                 aligned_dst.x, aligned_dst.y,
+                                 aligned_dst.width, aligned_dst.height,
                                  fixed_x, fixed_y,
                                  fixed_w, fixed_h))
             {
@@ -731,15 +880,13 @@ _secPlaneShowInternal (SECPlaneTable *table,
 
                 return FALSE;
             }
-
             if (!table->visible)
             {
                 XDBG_SECURE (MPLN, "plane(%d) crtc(%d) pos(%d) on: access_fb(%d,%dx%d,[%d,%d %dx%d]=>[%d,%d %dx%d])\n",
                              table->plane_id, table->crtc_id, table->zpos,
                              access->fb_id, access->width, access->height,
-                             aligned_src_x, access->src.y, aligned_src_w, access->src.height,
-                             aligned_dst_x, access->dst.y, aligned_dst_w, access->dst.height);
-
+                             aligned_src.x, aligned_src.y, aligned_src.width, aligned_src.height,
+                             aligned_dst.x, aligned_dst.y, aligned_dst.width, aligned_dst.height);
                 table->visible = TRUE;
             }
         }
@@ -797,6 +944,7 @@ _secPlaneHideInternal (SECPlaneTable *table)
     return TRUE;
 
 }
+
 
 void
 secPlaneInit (ScrnInfoPtr pScrn, SECModePtr pSecMode, int num)
@@ -886,7 +1034,8 @@ secPlaneShowAll (int crtc_id)
 
         if (table->crtc_id != crtc_id)
             continue;
-
+        if (!table->cur_fb)
+            continue;
         if (!_secPlaneShowInternal (table, table->cur_fb, table->cur_fb,
                                     &table->src, &table->dst, table->zpos, TRUE))
 
@@ -899,7 +1048,7 @@ secPlaneShowAll (int crtc_id)
     }
 }
 
-int
+intptr_t
 secPlaneGetID (void)
 {
     SECPlaneTable *table = _secPlaneTableFindEmpty ();
@@ -919,7 +1068,7 @@ secPlaneGetID (void)
 }
 
 void
-secPlaneFreeId (int plane_id)
+secPlaneFreeId (intptr_t plane_id)
 {
     SECPlaneTable *table = _secPlaneTableFind (plane_id);
     SECPlaneFb *fb = NULL, *fb_next = NULL;
@@ -935,7 +1084,6 @@ secPlaneFreeId (int plane_id)
     memset (&table->src, 0x00, sizeof (xRectangle));
     memset (&table->dst, 0x00, sizeof (xRectangle));
 
-    table->cur_fb = NULL;
     xorg_list_for_each_entry_safe (fb, fb_next, &table->fbs, link)
     {
         _secPlaneTableFreeBuffer (table, fb);
@@ -963,8 +1111,38 @@ secPlaneFreeId (int plane_id)
     XDBG_TRACE (MPLN, "plane(%d).\n", table->plane_id);
 }
 
+void
+secPlaneFlushFBId (intptr_t plane_id)
+{
+    SECPlaneTable *table = _secPlaneTableFind (plane_id);
+    SECPlaneFb *fb = NULL, *fb_next = NULL;
+
+    XDBG_RETURN_IF_FAIL (table != NULL);
+    table->cur_fb = NULL;
+    xorg_list_for_each_entry_safe (fb, fb_next, &table->fbs, link)
+    {
+        _secPlaneTableFreeBuffer (table, fb);
+    }
+
+    if (table->access)
+    {
+        if (table->access->fb_id)
+        {
+            SECModePtr pSecMode = table->pPlanePriv->pSecMode;
+            if (pSecMode)
+                drmModeRmFB (pSecMode->fd, table->access->fb_id);
+        }
+
+        if (table->access->bo)
+            tbm_bo_unref (table->access->bo);
+    }
+
+    XDBG_TRACE (MPLN, "flush plane(%d).\n", table->plane_id);
+}
+
+
 Bool
-secPlaneTrun (int plane_id, Bool onoff, Bool user)
+secPlaneTrun (intptr_t plane_id, Bool onoff, Bool user)
 {
     SECPlaneTable *table = _secPlaneTableFind (plane_id);
     SECPtr pSec;
@@ -1019,7 +1197,7 @@ secPlaneTrun (int plane_id, Bool onoff, Bool user)
 }
 
 Bool
-secPlaneTrunStatus (int plane_id)
+secPlaneTrunStatus (intptr_t plane_id)
 {
     SECPlaneTable *table = _secPlaneTableFind (plane_id);
 
@@ -1029,7 +1207,7 @@ secPlaneTrunStatus (int plane_id)
 }
 
 void
-secPlaneFreezeUpdate (int plane_id, Bool enable)
+secPlaneFreezeUpdate (intptr_t plane_id, Bool enable)
 {
     SECPlaneTable *table = _secPlaneTableFind (plane_id);
 
@@ -1038,33 +1216,33 @@ secPlaneFreezeUpdate (int plane_id, Bool enable)
     table->freeze_update = enable;
 }
 
-Bool
-secPlaneRemoveBuffer (int plane_id, int fb_id)
-{
-    SECPlaneTable *table;
-    SECPlaneFb *fb;
-
-    XDBG_RETURN_VAL_IF_FAIL (fb_id > 0, FALSE);
-
-    table = _secPlaneTableFind (plane_id);
-    XDBG_RETURN_VAL_IF_FAIL (table != NULL, FALSE);
-
-    fb = _secPlaneTableFindBuffer (table, fb_id, NULL, NULL);
-    XDBG_RETURN_VAL_IF_FAIL (fb != NULL, FALSE);
-
-    _secPlaneTableFreeBuffer (table, fb);
-
-    XDBG_TRACE (MPLN, "plane(%d) fb(%d). \n", plane_id, fb_id);
-
-    return TRUE;
-}
+//Bool
+//secPlaneRemoveBuffer (intptr_t plane_id, int fb_id)
+//{
+//    SECPlaneTable *table;
+//    SECPlaneFb *fb;
+//
+//    XDBG_RETURN_VAL_IF_FAIL (fb_id > 0, FALSE);
+//
+//    table = _secPlaneTableFind (plane_id);
+//    XDBG_RETURN_VAL_IF_FAIL (table != NULL, FALSE);
+//
+//    fb = _secPlaneTableFindBuffer (table, fb_id, NULL, NULL);
+//    XDBG_RETURN_VAL_IF_FAIL (fb != NULL, FALSE);
+//
+//    _secPlaneTableFreeBuffer (table, fb);
+//
+//    XDBG_TRACE (MPLN, "plane(%d) fb(%d). \n", plane_id, fb_id);
+//
+//    return TRUE;
+//}
 
 int
-secPlaneAddBo (int plane_id, tbm_bo bo)
+secPlaneAddBo (intptr_t plane_id, tbm_bo bo)
 {
     SECPlaneTable *table;
     SECPlaneFb *fb;
-    int fb_id = 0;
+    intptr_t fb_id = 0;
     SECFbBoDataPtr bo_data = NULL;
     int width, height;
 
@@ -1106,7 +1284,7 @@ secPlaneAddBo (int plane_id, tbm_bo bo)
 }
 
 int
-secPlaneAddBuffer (int plane_id, SECVideoBuf *vbuf)
+secPlaneAddBuffer (intptr_t plane_id, SECVideoBuf *vbuf)
 {
     SECPlaneTable *table;
     SECPlaneFb *fb;
@@ -1136,13 +1314,13 @@ secPlaneAddBuffer (int plane_id, SECVideoBuf *vbuf)
 
     secUtilAddFreeVideoBufferFunc (vbuf, _secPlaneFreeVbuf, (void*)plane_id);
 
-    XDBG_TRACE (MPLN, "plane(%d) vbuf(%ld,%d,%dx%d)\n", plane_id,
+    XDBG_TRACE (MPLN, "plane(%d) vbuf(%"PRIuPTR",%d,%dx%d)\n", plane_id,
                 vbuf->stamp, vbuf->fb_id, vbuf->width, vbuf->height);
 
     return fb->id;
 }
 
-int
+intptr_t
 secPlaneGetBuffer (int plane_id, tbm_bo bo, SECVideoBuf *vbuf)
 {
     SECPlaneTable *table;
@@ -1178,15 +1356,14 @@ secPlaneGetBufferSize (int plane_id, int fb_id, int *width, int *height)
 }
 
 Bool
-secPlaneAttach (int plane_id, int fb_id)
+secPlaneAttach (int plane_id, int fb_id, SECVideoBuf *vbuf)
 {
     SECPlaneTable *table = _secPlaneTableFind (plane_id);
     SECPlaneFb *fb;
 
     XDBG_RETURN_VAL_IF_FAIL (table != NULL, FALSE);
-    XDBG_RETURN_VAL_IF_FAIL (fb_id > 0, FALSE);
 
-    fb = _secPlaneTableFindBuffer (table, fb_id, NULL, NULL);
+    fb = _secPlaneTableFindBuffer (table, fb_id, NULL, vbuf);
     XDBG_RETURN_VAL_IF_FAIL (fb != NULL, FALSE);
 
     table->cur_fb = fb;
@@ -1224,7 +1401,7 @@ secPlaneShow (int plane_id, int crtc_id,
 
     temp = _secPlaneTableFindPos (crtc_id, zpos);
 
-    if (temp && temp->plane_id != plane_id)
+    if (!need_update && temp && temp->plane_id != plane_id && temp->visible)
     {
         XDBG_ERROR (MPLN, "can't change zpos. plane(%d) is at zpos(%d) crtc(%d) \n",
                     temp->plane_id, temp->zpos, crtc_id);
@@ -1314,7 +1491,7 @@ secPlaneDump (char *reply, int *len)
     for (i = 0; i < plane_table_size; i++)
     {
         if (plane_table[i].in_use)
-            XDBG_REPLY ("%d\t%d\t%d\t%d\t%d\t%d(%dx%d)\t%d,%d %dx%d\t%d,%d %dx%d\n",
+            XDBG_REPLY ("%"PRIdPTR"\t%d\t%d\t%d\t%d\t%"PRIdPTR"(%dx%d)\t%d,%d %dx%d\t%d,%d %dx%d\n",
                         plane_table[i].plane_id,
                         plane_table[i].crtc_id, plane_table[i].zpos,
                         plane_table[i].visible,
@@ -1331,4 +1508,10 @@ secPlaneDump (char *reply, int *len)
     XDBG_REPLY ("=================================================\n");
 
     return reply;
+}
+
+int
+secPlaneGetCount(void)
+{
+    return plane_table_size;
 }

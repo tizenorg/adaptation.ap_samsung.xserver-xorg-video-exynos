@@ -43,6 +43,7 @@ typedef enum
     WB_NOTI_START,
     WB_NOTI_IPP_EVENT,
     WB_NOTI_IPP_EVENT_DONE,
+    WB_NOTI_PAUSE,
     WB_NOTI_STOP,
     WB_NOTI_CLOSED,
 } SECWbNotify;
@@ -88,6 +89,9 @@ void   secWbRemoveNotifyFunc (SECWb *wb, WbNotifyFunc func);
 Bool   secWbIsOpened  (void);
 Bool   secWbIsRunning (void);
 void   secWbDestroy   (void);
+
+void   secWbPause (SECWb *wb);
+void   secWbResume (SECWb *wb);
 
 unsigned int secWbGetPropID (void);
 void   secWbHandleIppEvent (int fd, unsigned int *buf_idx, void *data);

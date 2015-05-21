@@ -24,7 +24,7 @@
 #include "libdrm/drm.h"
 #include "xf86drm.h"
 #include "xf86drmMode.h"
-#include "exynos_drm.h"
+#include <exynos/exynos_drm.h>
 #include "sec_display.h"
 #include "sec_util.h"
 

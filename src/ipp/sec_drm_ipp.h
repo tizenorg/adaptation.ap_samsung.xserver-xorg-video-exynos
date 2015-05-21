@@ -32,7 +32,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define __SEC_DRM_IPP_H__
 
 #include <fbdevhw.h>
-#include <exynos_drm.h>
+#include <exynos/exynos_drm.h>
 
 /* A drmfmt list newly allocated. should be freed. */
 unsigned int* secDrmIppGetFormatList (int *num);

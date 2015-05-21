@@ -33,6 +33,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include "sec_video_types.h"
 #include "sec_video_fourcc.h"
+#include <xf86Crtc.h>
 
 typedef enum
 {
@@ -49,6 +50,9 @@ typedef enum
     LAYER_DEFAULT   =  0,
     LAYER_UPPER     = +1,
     LAYER_MAX       = +2,
+#ifdef LAYER_MANAGER
+    FOR_LAYER_MNG   = +3,
+#endif
 } SECLayerPos;
 
 #define LAYER_DESTROYED         1
@@ -56,9 +60,17 @@ typedef enum
 #define LAYER_HIDDEN            3
 /* To manage buffer */
 #define LAYER_BUF_CHANGED       4  /* type_data: SECLayerBufInfo */
-#define LAYER_VBLANK            5  /* type_data: SECLayerBufInfo */
+#define LAYER_VBLANK            5  /* type_data: SECLayerVblankDatePtr */
 
-typedef struct _SECLayer SECLayer;
+typedef struct _layerVblankDate
+{
+    unsigned int frame;
+    unsigned int tv_sec;
+    unsigned int tv_usec;
+    SECVideoBuf * vbuf;
+} SECLayerVblankDateRec, * SECLayerVblankDatePtr;
+
+typedef struct _SECLayer SECLayer, *SECLayerPtr;
 
 typedef void (*NotifyFunc) (SECLayer *layer, int type, void *type_data, void *user_data);
 
@@ -66,6 +78,7 @@ Bool        secLayerSupport     (ScrnInfoPtr pScrn, SECLayerOutput output,
                                  SECLayerPos lpos, unsigned int id);
 
 SECLayer*   secLayerFind        (SECLayerOutput output, SECLayerPos lpos);
+SECLayer*   secLayerFindByDraw  (DrawablePtr);
 void        secLayerDestroyAll  (void);
 void        secLayerShowAll     (ScrnInfoPtr pScrn, SECLayerOutput output);
 
@@ -80,12 +93,13 @@ Bool        secLayerIsVisible (SECLayer *layer);
 void        secLayerShow      (SECLayer *layer);
 void        secLayerHide      (SECLayer *layer);
 void        secLayerFreezeUpdate (SECLayer *layer, Bool enable);
+Bool        secLayerIsNeedUpdate (SECLayer *layer);
 void        secLayerUpdate    (SECLayer *layer);
 void        secLayerTurn      (SECLayer *layer, Bool onoff, Bool user);
 Bool        secLayerTurnStatus (SECLayer *layer);
 
 void        secLayerEnableVBlank (SECLayer *layer, Bool enable);
-
+Bool        secLayerIsPanding (SECLayer *layer);
 Bool        secLayerSetOffset (SECLayer *layer, int x, int y);
 void        secLayerGetOffset (SECLayer *layer, int *x, int *y);
 
@@ -99,7 +113,24 @@ void        secLayerGetRect   (SECLayer *layer, xRectangle *src, xRectangle *dst
 int          secLayerSetBuffer (SECLayer *layer, SECVideoBuf *vbuf);
 SECVideoBuf* secLayerGetBuffer (SECLayer *layer);
 
+DrawablePtr secLayerGetDraw   (SECLayer *layer);
+Bool        secLayerSetDraw   (SECLayer *layer, DrawablePtr pDraw);
+
+SECVideoBuf* secLayerGetMatchBuf(SECLayer *layer, tbm_bo bo);
+
+Bool        secLayerIsUpdateDRI (SECLayer *layer);
+void        secLayerUpdateDRI   (SECLayer *layer, Bool );
+
+Bool        secLayerSetAsDefault(SECLayer *layer);
+SECLayerPtr secLayerGetDefault (xf86CrtcPtr pCrtc);
+
+ScrnInfoPtr secLayerGetScrn   (SECLayer *layer);
+
 void        secLayerVBlankEventHandler (unsigned int frame, unsigned int tv_sec,
                                         unsigned int tv_usec, void *event_data);
+Bool        secLayerExistNotifyFunc (SECLayer* layer, NotifyFunc func);
 
+void        secLayerDestroy(SECLayer *layer);
+void        secLayerClearQueue (SECLayer *layer);
+Bool        secLayerSetOutput (SECLayer *layer, SECLayerOutput output);
 #endif /* __SEC_LAYER_H__ */

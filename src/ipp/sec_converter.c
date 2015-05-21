@@ -46,6 +46,8 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define CVT_BUF_MAX    6
 #endif
 
+static Bool can_pause = TRUE;
+
 typedef struct _SECCvtFuncData
 {
     CvtFunc  func;
@@ -67,7 +69,7 @@ typedef struct _SECCvtBuf
 
 struct _SECCvt
 {
-    CARD32        stamp;
+    uintptr_t     stamp;
 
     int  prop_id;
 
@@ -85,6 +87,7 @@ struct _SECCvt
 #endif
 
     Bool          started;
+    Bool          paused;
     Bool          first_event;
 
     struct xorg_list   link;
@@ -127,7 +130,7 @@ _initList (void)
 }
 
 static SECCvt*
-_findCvt (CARD32 stamp)
+_findCvt (uintptr_t stamp)
 {
     SECCvt *cur = NULL, *next = NULL;
 
@@ -225,7 +228,7 @@ _SetVbufConverting (SECVideoBuf *vbuf, SECCvt *cvt, Bool converting)
             }
         }
 
-        XDBG_ERROR (MCVT, "failed: %ld not found in %ld.\n", cvt->stamp, vbuf->stamp);
+        XDBG_ERROR (MCVT, "failed: %"PRIuPTR" not found in %"PRIuPTR".\n", cvt->stamp, vbuf->stamp);
         return FALSE;
     }
     else
@@ -236,7 +239,7 @@ _SetVbufConverting (SECVideoBuf *vbuf, SECCvt *cvt, Bool converting)
         {
             if (info->cvt == (void*)cvt)
             {
-                XDBG_ERROR (MCVT, "failed: %ld already converting %ld.\n", cvt->stamp, vbuf->stamp);
+                XDBG_ERROR (MCVT, "failed: %"PRIuPTR" already converting %"PRIuPTR".\n", cvt->stamp, vbuf->stamp);
                 return FALSE;
             }
         }
@@ -630,7 +633,7 @@ SECCvt*
 secCvtCreate (ScrnInfoPtr pScrn, SECCvtOp op)
 {
     SECCvt *cvt;
-    CARD32 stamp = GetTimeInMillis ();
+    uintptr_t stamp = (uintptr_t) GetTimeInMillis ();
 
     _initList ();
 
@@ -653,7 +656,7 @@ secCvtCreate (ScrnInfoPtr pScrn, SECCvtOp op)
     xorg_list_init (&cvt->src_bufs);
     xorg_list_init (&cvt->dst_bufs);
 
-    XDBG_TRACE (MCVT, "op(%d), cvt(%p) stamp(%ld)\n", op, cvt, stamp);
+    XDBG_TRACE (MCVT, "op(%d), cvt(%p) stamp(%"PRIuPTR")\n", op, cvt, stamp);
 
     xorg_list_add (&cvt->link, &cvt_list);
 
@@ -694,7 +697,7 @@ secCvtGetOp (SECCvt *cvt)
 Bool
 secCvtSetProperpty (SECCvt *cvt, SECCvtProp *src, SECCvtProp *dst)
 {
-    if (cvt->started)
+    if (cvt->started && !cvt->paused)
         return TRUE;
 
     struct drm_exynos_ipp_property property;
@@ -736,7 +739,9 @@ secCvtSetProperpty (SECCvt *cvt, SECCvtProp *src, SECCvtProp *dst)
     property.type = IPP_EVENT_DRIVEN;
 #endif
     property.prop_id = cvt->prop_id;
+#ifdef LEGACY_INTERFACE
     property.protect = dst->secure;
+#endif
     property.range = dst->csc_range;
 
     XDBG_TRACE (MCVT, "cvt(%p) src('%c%c%c%c', '%c%c%c%c', %dx%d, %d,%d %dx%d, %d, %d&%d, %d, %d)\n",
@@ -784,6 +789,8 @@ secCvtConvert (SECCvt *cvt, SECVideoBuf *src, SECVideoBuf *dst)
     XDBG_RETURN_VAL_IF_FAIL (VBUF_IS_VALID (src), FALSE);
     XDBG_RETURN_VAL_IF_FAIL (VBUF_IS_VALID (dst), FALSE);
 
+    TTRACE_VIDEO_BEGIN("XORG:IPP:CONVERT");
+
     _fillProperty (cvt, CVT_TYPE_SRC, src, &src_prop);
     _fillProperty (cvt, CVT_TYPE_DST, dst, &dst_prop);
 
@@ -817,6 +824,9 @@ secCvtConvert (SECCvt *cvt, SECVideoBuf *src, SECVideoBuf *dst)
                     dst_prop.crop.x, dst_prop.crop.y, dst_prop.crop.width, dst_prop.crop.height,
                     dst_prop.degree, dst_prop.hflip, dst_prop.vflip,
                     dst_prop.secure, dst_prop.csc_range);
+
+        TTRACE_VIDEO_END();
+
         return FALSE;
     }
 
@@ -855,7 +865,7 @@ secCvtConvert (SECCvt *cvt, SECVideoBuf *src, SECVideoBuf *dst)
     XDBG_DEBUG (MCVT, "cvt(%p) dstbuf(%p) converting(%d)\n",
                 cvt, dst, VBUF_IS_CONVERTING (dst));
 
-    XDBG_DEBUG (MVBUF, "==> ipp (%ld,%d,%d : %ld,%d,%d) \n",
+    XDBG_DEBUG (MVBUF, "==> ipp (%"PRIuPTR",%d,%d : %"PRIuPTR",%d,%d) \n",
                 src->stamp, VBUF_IS_CONVERTING (src), src->showing,
                 dst->stamp, VBUF_IS_CONVERTING (dst), dst->showing);
 
@@ -873,12 +883,28 @@ secCvtConvert (SECCvt *cvt, SECVideoBuf *src, SECVideoBuf *dst)
 
         cvt->started = TRUE;
     }
+    else if (cvt->paused)
+    {
+        struct drm_exynos_ipp_cmd_ctrl ctrl = {0,};
+
+        ctrl.prop_id = cvt->prop_id;
+        ctrl.ctrl = IPP_CTRL_RESUME;
+
+        XDBG_GOTO_IF_FAIL(secDrmIppCmdCtrl (cvt->pScrn, &ctrl),
+                          fail_to_convert);
+
+        XDBG_TRACE (MCVT, "cvt(%p) resume.\n", cvt);
+
+        cvt->paused = FALSE;
+    }
 
     dst->dirty = TRUE;
 
     SECPtr pSec = SECPTR (cvt->pScrn);
     if (pSec->xvperf_mode & XBERC_XVPERF_MODE_CVT)
         src_cbuf->begin = GetTimeInMillis ();
+
+    TTRACE_VIDEO_END();
 
     return TRUE;
 
@@ -888,8 +914,10 @@ fail_to_convert:
         free (src_cbuf);
     if (dst_cbuf)
         free (dst_cbuf);
-
+    can_pause = FALSE;
     _secCvtStop (cvt);
+
+    TTRACE_VIDEO_END();
 
     return FALSE;
 }
@@ -934,7 +962,7 @@ secCvtRemoveCallback (SECCvt *cvt, CvtFunc func, void *data)
 void
 secCvtHandleIppEvent (int fd, unsigned int *buf_idx, void *data, Bool error)
 {
-    CARD32 stamp = (CARD32)data;
+    uintptr_t stamp = (uintptr_t)data;
     SECCvt *cvt;
     SECCvtBuf *src_cbuf, *dst_cbuf;
     SECVideoBuf *src_vbuf, *dst_vbuf;
@@ -945,9 +973,11 @@ secCvtHandleIppEvent (int fd, unsigned int *buf_idx, void *data, Bool error)
     cvt = _findCvt (stamp);
     if (!cvt)
     {
-        XDBG_DEBUG (MCVT, "invalid cvt's stamp (%ld).\n", stamp);
+        XDBG_DEBUG (MCVT, "invalid cvt's stamp (%"PRIuPTR").\n", stamp);
         return;
     }
+
+    TTRACE_VIDEO_BEGIN("XORG:IPP:CVT_IPPEVENT");
 
     XDBG_DEBUG (MCVT, "cvt(%p) index(%d, %d)\n",
                 cvt, buf_idx[EXYNOS_DRM_OPS_SRC], buf_idx[EXYNOS_DRM_OPS_DST]);
@@ -982,10 +1012,10 @@ secCvtHandleIppEvent (int fd, unsigned int *buf_idx, void *data, Bool error)
 #endif
 
     src_cbuf = _secCvtFindBuf (cvt, EXYNOS_DRM_OPS_SRC, buf_idx[EXYNOS_DRM_OPS_SRC]);
-    XDBG_RETURN_IF_FAIL (src_cbuf != NULL);
+    XDBG_GOTO_IF_FAIL (src_cbuf != NULL, handle_done);
 
     dst_cbuf = _secCvtFindBuf (cvt, EXYNOS_DRM_OPS_DST, buf_idx[EXYNOS_DRM_OPS_DST]);
-    XDBG_RETURN_IF_FAIL (dst_cbuf != NULL);
+    XDBG_GOTO_IF_FAIL (dst_cbuf != NULL, handle_done);
 
     SECPtr pSec = SECPTR (cvt->pScrn);
     if (pSec->xvperf_mode & XBERC_XVPERF_MODE_CVT)
@@ -993,13 +1023,13 @@ secCvtHandleIppEvent (int fd, unsigned int *buf_idx, void *data, Bool error)
         CARD32 cur, sub;
         cur = GetTimeInMillis ();
         sub = cur - src_cbuf->begin;
-        ErrorF ("cvt(%p)   ipp interval  : %6ld ms\n", cvt, sub);
+        ErrorF ("cvt(%p)   ipp interval  : %6"PRIXID" ms\n", cvt, sub);
     }
 
     src_vbuf = src_cbuf->vbuf;
     dst_vbuf = dst_cbuf->vbuf;
 
-    XDBG_DEBUG (MVBUF, "<== ipp (%ld,%d,%d : %ld,%d,%d) \n",
+    XDBG_DEBUG (MVBUF, "<== ipp (%"PRIuPTR",%d,%d : %"PRIuPTR",%d,%d) \n",
                 src_vbuf->stamp, VBUF_IS_CONVERTING (src_vbuf), src_vbuf->showing,
                 dst_vbuf->stamp, VBUF_IS_CONVERTING (dst_vbuf), dst_vbuf->showing);
 
@@ -1017,4 +1047,55 @@ secCvtHandleIppEvent (int fd, unsigned int *buf_idx, void *data, Bool error)
 
     _secCvtDequeued (cvt, EXYNOS_DRM_OPS_SRC, buf_idx[EXYNOS_DRM_OPS_SRC]);
     _secCvtDequeued (cvt, EXYNOS_DRM_OPS_DST, buf_idx[EXYNOS_DRM_OPS_DST]);
+
+handle_done:
+    TTRACE_VIDEO_END();
+}
+
+Bool
+secCvtPause (SECCvt *cvt)
+{
+    XDBG_RETURN_VAL_IF_FAIL (cvt != NULL, FALSE);
+    if (!can_pause)
+    {
+        XDBG_DEBUG (MCVT, "IPP not support pause-resume mode\n");
+        return FALSE;
+    }
+    if (cvt->paused)
+    {
+        XDBG_WARNING (MCVT, "IPP already in pause state\n");
+        return TRUE;
+    }
+    struct drm_exynos_ipp_cmd_ctrl ctrl = {0,};
+
+    ctrl.prop_id = cvt->prop_id;
+    ctrl.ctrl = IPP_CTRL_PAUSE;
+
+    XDBG_GOTO_IF_FAIL(secDrmIppCmdCtrl (cvt->pScrn, &ctrl),
+                      fail_to_pause);
+
+    XDBG_TRACE (MCVT, "cvt(%p) pause.\n", cvt);
+
+    cvt->paused = TRUE;
+
+    return TRUE;
+
+fail_to_pause:
+
+    XDBG_ERROR (MCVT, "cvt(%p) pause error.\n", cvt);
+    can_pause = FALSE;
+
+//    _secCvtStop (cvt);
+
+    return FALSE;
+}
+
+uintptr_t
+secCvtGetStamp (SECCvt *cvt)
+{
+    if (cvt == NULL)
+    {
+        return 0;
+    }
+    return cvt->stamp;
 }

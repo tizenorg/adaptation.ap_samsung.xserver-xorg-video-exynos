@@ -53,6 +53,9 @@
 #include "sec_layer.h"
 
 #include "fimg2d.h"
+#ifdef LAYER_MANAGER
+#include "sec_layer_manager.h"
+#endif
 
 #define SEC_MAX_PORT        1
 #define LAYER_BUF_CNT       3
@@ -112,10 +115,16 @@ typedef struct
     ScrnInfoPtr pScrn;
     GetData d;
     GetData old_d;
-
+#ifndef LAYER_MANAGER
     /* layer */
     SECLayer *layer;
+#else
+    SECLayerMngClientID lyr_client_id;
+    SECLayerPos lpos;
+    SECLayerOutput output;
+#endif
     SECVideoBuf *outbuf[LAYER_BUF_CNT];
+
 
     int    stream_cnt;
     struct xorg_list link;
@@ -239,8 +248,8 @@ static Bool
 _secDisplayVideoShowLayer (SECPortPrivPtr pPort, SECVideoBuf *vbuf,
                            SECLayerOutput output, SECLayerPos lpos)
 {
+#ifndef LAYER_MANAGER
     xRectangle src_rect, dst_rect;
-
     if (!pPort->layer)
     {
         SECModePtr pSecMode = (SECModePtr) SECPTR (pPort->pScrn)->pSecMode;
@@ -271,7 +280,28 @@ _secDisplayVideoShowLayer (SECPortPrivPtr pPort, SECVideoBuf *vbuf,
     secLayerSetBuffer (pPort->layer, vbuf);
     if (!secLayerIsVisible (pPort->layer))
         secLayerShow (pPort->layer);
+#else
+   if (pPort->lpos == LAYER_NONE)
+   {
+       if (!secUtilEnsureExternalCrtc (pPort->pScrn))
+       {
+           XDBG_ERROR (MDA, "failed : pPort(%d) connect external crtc\n", pPort->index);
+           return FALSE;
+       }
+       if (secLayerMngSet(pPort->lyr_client_id, 0, 0, &pPort->d.src, &pPort->d.dst, NULL, vbuf,
+                          output, lpos, NULL, NULL))
+       {
+           pPort->lpos = lpos;
+           pPort->output = output;
+       }
+       else
+       {
+           XDBG_ERROR (MDA, "Can't set layer %d\n", pPort->index);
+           return FALSE;
+       }
 
+   }
+#endif
     XDBG_DEBUG (MDA, "pDraw(0x%lx), fb_id(%d), (%d,%d %dx%d) (%d,%d %dx%d)\n",
                 pPort->d.pDraw->id, vbuf->fb_id,
                 pPort->d.src.x, pPort->d.src.y, pPort->d.src.width, pPort->d.src.height,
@@ -283,11 +313,19 @@ _secDisplayVideoShowLayer (SECPortPrivPtr pPort, SECVideoBuf *vbuf,
 static void
 _secDisplayVideoHideLayer (SECPortPrivPtr pPort)
 {
+#ifndef LAYER_MANAGER
     if (!pPort->layer)
         return;
 
     secLayerUnref (pPort->layer);
     pPort->layer = NULL;
+#else
+    if (pPort->lpos != LAYER_NONE)
+    {
+        secLayerMngRelease(pPort->lyr_client_id, pPort->output, pPort->lpos);
+        pPort->lpos = LAYER_NONE;
+    }
+#endif
 }
 
 static SECVideoBuf*
@@ -319,7 +357,7 @@ _secDisplayVideoGetBuffer (SECPortPrivPtr pPort)
         return NULL;
     }
 
-    XDBG_DEBUG (MDA, "outbuf: stamp(%ld) index(%d) h(%d,%d,%d)\n",
+    XDBG_DEBUG (MDA, "outbuf: stamp(%"PRIuPTR") index(%d) h(%d,%d,%d)\n",
                 pPort->outbuf[i]->stamp, i,
                 pPort->outbuf[i]->handles[0],
                 pPort->outbuf[i]->handles[1],
@@ -354,7 +392,10 @@ _secDisplayVideoStreamOff (SECPortPrivPtr pPort)
 {
     _secDisplayVideoHideLayer (pPort);
     _secDisplayVideoCloseBuffers (pPort);
-
+#ifdef LAYER_MANAGER
+    secLayerMngUnRegisterClient(pPort->lyr_client_id);
+    pPort->lyr_client_id = LYR_ERROR_ID;
+#endif
     memset (&pPort->old_d, 0, sizeof (GetData));
     memset (&pPort->d, 0, sizeof (GetData));
 
@@ -460,7 +501,7 @@ SECDisplayVideoSetPortAttribute (ScrnInfoPtr pScrn,
     if (attribute == _portAtom (PAA_OVERLAY))
     {
         pPort->overlay = value;
-        XDBG_DEBUG (MDA, "overlay(%d) \n", value);
+        XDBG_DEBUG (MDA, "overlay(%d) \n", (int) value);
         return Success;
     }
 
@@ -494,7 +535,20 @@ SECDisplayVideoGetStill (ScrnInfoPtr pScrn,
     pPort->d.dst.width = drw_w;
     pPort->d.dst.height = drw_h;
     pPort->d.pDraw = pDraw;
-
+#ifdef LAYER_MANAGER
+    if (pPort->lyr_client_id == LYR_ERROR_ID)
+    {
+        char client_name[20] = {0};
+        if (sprintf(client_name, "XV_PUTSTILL-%d", pPort->index) < 0)
+        {
+            XDBG_ERROR(MDA, "Can't register layer manager client\n");
+            return BadRequest;
+        }
+        pPort->lyr_client_id = secLayerMngRegisterClient(pScrn, client_name, 2);
+        XDBG_RETURN_VAL_IF_FAIL (pPort->lyr_client_id != LYR_ERROR_ID, BadRequest);
+        pPort->lpos = LAYER_NONE;
+    }
+#endif
     if (pPort->old_d.width != pPort->d.width ||
         pPort->old_d.height != pPort->d.height)
     {
@@ -596,6 +650,10 @@ secVideoSetupDisplayVideo (ScreenPtr pScreen)
     {
         pAdaptor->pPortPrivates[i].ptr = &pPort[i];
         pPort[i].index = i;
+#ifdef LAYER_MANAGER
+        pPort[i].lpos = LAYER_NONE;
+        pPort[i].lyr_client_id = LYR_ERROR_ID;
+#endif
     }
 
     pAdaptor->nAttributes = NUM_ATTRIBUTES;

@@ -39,18 +39,23 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <errno.h>
 #include <X11/XWDFile.h>
 
 #include "sec.h"
 #include "sec_util.h"
 #include "sec_output.h"
 #include "sec_video_fourcc.h"
-#include <exynos_drm.h>
+#include <exynos/exynos_drm.h>
 #include <list.h>
+
+#include <png.h>
 
 #include "fimg2d.h"
 
 #define DUMP_SCALE_RATIO  2
+#define PNG_DEPTH 8
+
 
 int secUtilDumpBmp (const char * file, const void * data, int width, int height)
 {
@@ -121,6 +126,78 @@ int secUtilDumpBmp (const char * file, const void * data, int width, int height)
     return UTIL_DUMP_OK;
 }
 
+static int secUtilDumpPng (const char* file, const void * data, int width, int height)
+{
+    XDBG_RETURN_VAL_IF_FAIL (data != NULL, UTIL_DUMP_ERR_INTERNAL);
+    XDBG_RETURN_VAL_IF_FAIL (width > 0, UTIL_DUMP_ERR_INTERNAL);
+    XDBG_RETURN_VAL_IF_FAIL (height > 0, UTIL_DUMP_ERR_INTERNAL);
+
+    FILE *fp = fopen(file, "wb");
+    int res = UTIL_DUMP_ERR_OPENFILE;
+    if (fp)
+    {
+        res = UTIL_DUMP_ERR_PNG;
+        png_structp pPngStruct = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+        if (pPngStruct)
+        {
+            png_infop pPngInfo = png_create_info_struct(pPngStruct);
+            if (pPngInfo)
+            {
+                png_init_io(pPngStruct, fp);
+                png_set_IHDR(pPngStruct,
+                        pPngInfo,
+                        width,
+                        height,
+                        PNG_DEPTH,
+                        PNG_COLOR_TYPE_RGBA,
+                        PNG_INTERLACE_NONE,
+                        PNG_COMPRESSION_TYPE_DEFAULT,
+                        PNG_FILTER_TYPE_DEFAULT);
+
+                png_set_bgr(pPngStruct);
+                png_write_info(pPngStruct, pPngInfo);
+
+                const int pixel_size = 4; // RGBA
+                png_bytep *row_pointers = png_malloc (pPngStruct, height * sizeof(png_byte *));
+
+                unsigned int* blocks = (unsigned int*)data;
+                int y = 0;
+                int x = 0;
+
+                for (; y < height; ++y)
+                {
+                    png_bytep row = png_malloc(pPngStruct, sizeof(png_byte)*width * pixel_size);
+                    row_pointers[y] = (png_bytep)row;
+                    for (x = 0; x < width; ++x)
+                    {
+                        unsigned int curBlock = blocks[y * width + x];
+                        row[x * pixel_size] = (curBlock & 0xFF);
+                        row[1 + x * pixel_size] = (curBlock >> 8) & 0xFF;
+                        row[2 + x * pixel_size] = (curBlock >> 16) & 0xFF;
+                        row[3 + x * pixel_size] = (curBlock >> 24) & 0xFF;
+                    }
+                }
+
+                png_write_image(pPngStruct, row_pointers);
+                png_write_end(pPngStruct, pPngInfo);
+
+                for (y = 0; y < height; y++)
+                {
+                    png_free (pPngStruct, row_pointers[y]);
+                }
+                png_free (pPngStruct, row_pointers);
+
+                png_destroy_write_struct(&pPngStruct, &pPngInfo);
+
+                fclose(fp);
+                res = UTIL_DUMP_OK;
+            }
+        }
+    }
+
+    return res;
+}
+
 int secUtilDumpShm (int shmid, const void * data, int width, int height)
 {
     char * addr;
@@ -188,7 +265,7 @@ secUtilDumpPixmap (const char * file, PixmapPtr pPixmap)
         XDBG_RETURN_VAL_IF_FAIL (privPixmap->bo != NULL, UTIL_DUMP_ERR_INTERNAL);
     }
 
-    ret = secUtilDumpBmp (file, tbm_bo_get_handle (privPixmap->bo, TBM_DEVICE_CPU).ptr,
+    ret = secUtilDumpBmp(file, tbm_bo_get_handle (privPixmap->bo, TBM_DEVICE_CPU).ptr,
                           pPixmap->devKind/(pPixmap->drawable.bitsPerPixel >> 3),
                           pPixmap->drawable.height);
 
@@ -197,6 +274,13 @@ secUtilDumpPixmap (const char * file, PixmapPtr pPixmap)
 
     return ret;
 }
+
+enum DumpFormat
+{
+    DUMP_RAW = 0,
+    DUMP_BMP = 1,
+    DUMP_PNG
+};
 
 typedef struct _DumpBufInfo
 {
@@ -207,7 +291,7 @@ typedef struct _DumpBufInfo
 
     char   file[128];
     Bool   dirty;
-    Bool   dump_bmp;
+    enum DumpFormat   dump_format;
 
     int    width;
     int    height;
@@ -319,13 +403,14 @@ access_done:
 }
 
 static void
-_secUtilConvertBosPIXMAN (tbm_bo src_bo, int sw, int sh, xRectangle *sr, int sstride,
+_secUtilConvertBosPIXMAN (int src_id, tbm_bo src_bo, int sw, int sh, xRectangle *sr, int sstride,
                           tbm_bo dst_bo, int dw, int dh, xRectangle *dr, int dstride,
                           Bool composite, int rotate)
 {
     tbm_bo_handle src_bo_handle = {0,};
     tbm_bo_handle dst_bo_handle = {0,};
     pixman_op_t op;
+    pixman_format_code_t src_pix_format;
 
     src_bo_handle = tbm_bo_map (src_bo, TBM_DEVICE_CPU, TBM_OPTION_READ);
     XDBG_GOTO_IF_FAIL (src_bo_handle.ptr != NULL, access_done);
@@ -338,12 +423,15 @@ _secUtilConvertBosPIXMAN (tbm_bo src_bo, int sw, int sh, xRectangle *sr, int sst
     else
         op = PIXMAN_OP_OVER;
 
+    if (IS_YUV(src_id)) src_pix_format = PIXMAN_yuy2; //PIXMAN_yv12
+    else  src_pix_format = PIXMAN_a8r8g8b8;
+
     secUtilConvertImage (op, src_bo_handle.ptr, dst_bo_handle.ptr,
-                         PIXMAN_a8r8g8b8, PIXMAN_a8r8g8b8,
-                         sw, sh, sr,
-                         dw, dh, dr,
-                         NULL,
-                         rotate, FALSE, FALSE);
+                             src_pix_format, PIXMAN_a8r8g8b8,
+                             sw, sh, sr,
+                             dw, dh, dr,
+                             NULL,
+                             rotate, FALSE, FALSE);
 
 access_done:
     if (src_bo_handle.ptr)
@@ -352,9 +440,9 @@ access_done:
         tbm_bo_unmap (dst_bo);
 }
 
-/* support only RGB  */
+/* support only RGB and YUV */
 void
-secUtilConvertBos (ScrnInfoPtr pScrn,
+secUtilConvertBos (ScrnInfoPtr pScrn, int src_id,
                    tbm_bo src_bo, int sw, int sh, xRectangle *sr, int sstride,
                    tbm_bo dst_bo, int dw, int dh, xRectangle *dr, int dstride,
                    Bool composite, int rotate)
@@ -389,7 +477,7 @@ secUtilConvertBos (ScrnInfoPtr pScrn,
                                composite, rotate);
     else
     {
-        _secUtilConvertBosPIXMAN (src_bo, sw, sh, sr, sstride,
+        _secUtilConvertBosPIXMAN (src_id, src_bo, sw, sh, sr, sstride,
                                   dst_bo, dw, dh, dr, dstride,
                                   composite, rotate);
         tbm_bo_map(src_bo, TBM_DEVICE_CPU, TBM_OPTION_WRITE);
@@ -511,7 +599,7 @@ secUtilDoDumpRaws (void *d, tbm_bo *bo, int *size, int bo_cnt, const char *file)
     snprintf (next->file, sizeof (next->file), "%.3f_%s", GetTimeInMillis()/1000.0, file);
     memset (&next->rect, 0, sizeof (xRectangle));
     next->dirty = TRUE;
-    next->dump_bmp = FALSE;
+    next->dump_format = DUMP_RAW;
 
     XDBG_TRACE (MSEC, "DumpRaws: %ld(%d)\n", GetTimeInMillis () - prev, next->index);
 
@@ -524,7 +612,7 @@ end_dump_raws:
 }
 
 void
-secUtilDoDumpBmps (void *d, tbm_bo bo, int w, int h, xRectangle *crop, const char *file)
+secUtilDoDumpBmps (void *d, tbm_bo bo, int w, int h, xRectangle *crop, const char *file, const char* dumpType)
 {
     DumpInfo *dump = (DumpInfo*)d;
     DumpBufInfo *next = NULL;
@@ -559,7 +647,20 @@ secUtilDoDumpBmps (void *d, tbm_bo bo, int w, int h, xRectangle *crop, const cha
     snprintf (next->file, sizeof (next->file), "%.3f_%s", GetTimeInMillis()/1000.0, file);
 
     next->dirty = TRUE;
-    next->dump_bmp = TRUE;
+
+    if (strcmp(dumpType, DUMP_TYPE_PNG) == 0)
+    {
+        next->dump_format = DUMP_PNG;
+    }
+    else if (strcmp(dumpType, DUMP_TYPE_BMP) == 0)
+    {
+        next->dump_format = DUMP_BMP;
+    }
+    else
+    {
+        XDBG_ERROR(MSEC, "Unsupported dump-format\n");
+    }
+
     next->size = scale_w*scale_h*4;
 
     next->width = scale_w;
@@ -572,19 +673,17 @@ secUtilDoDumpBmps (void *d, tbm_bo bo, int w, int h, xRectangle *crop, const cha
     temp.width = (crop)?crop->width:w;
     temp.height = (crop)?crop->height:h;
 
-    secUtilConvertBos (dump->pScrn, bo, w, h, &temp, w*4,
+    secUtilConvertBos (dump->pScrn, 0,bo, w, h, &temp, w*4,
                        next->bo, scale_w, scale_h, &next->rect, scale_w*4,
                        FALSE, 0);
 
     XDBG_TRACE (MSEC, "DumpBmps: %ld(%d)\n", GetTimeInMillis () - prev, next->index);
 
     dump->cursor = next_cursor;
-
-    return;
 }
 
 void
-secUtilDoDumpPixmaps (void *d, PixmapPtr pPixmap, const char *file)
+secUtilDoDumpPixmaps (void *d, PixmapPtr pPixmap, const char *file, const char* dumpType)
 {
     SECPixmapPriv *privPixmap;
     xRectangle rect = {0,};
@@ -608,7 +707,7 @@ secUtilDoDumpPixmaps (void *d, PixmapPtr pPixmap, const char *file)
 
     secUtilDoDumpBmps (d, privPixmap->bo,
                        pPixmap->devKind/(pPixmap->drawable.bitsPerPixel >> 3),
-                       pPixmap->drawable.height, &rect, file);
+                       pPixmap->drawable.height, &rect, file, dumpType);
 
     if (need_finish)
         secExaFinishAccess (pPixmap, EXA_PREPARE_DEST);
@@ -623,7 +722,7 @@ secUtilDoDumpVBuf (void *d, SECVideoBuf *vbuf, const char *file)
     XDBG_RETURN_IF_FAIL (vbuf->secure == FALSE);
 
     if (IS_RGB (vbuf->id))
-        secUtilDoDumpBmps (d, vbuf->bo[0], vbuf->width, vbuf->height, &vbuf->crop, file);
+        secUtilDoDumpBmps (d, vbuf->bo[0], vbuf->width, vbuf->height, &vbuf->crop, file, DUMP_TYPE_BMP);
     else if (vbuf->id == FOURCC_SN12 || vbuf->id == FOURCC_ST12)
         secUtilDoDumpRaws (d, vbuf->bo, vbuf->lengths, 2, file);
     else
@@ -644,10 +743,10 @@ secUtilFlushDump (void *d)
     if (!is_dir)
     {
         DIR *dp;
-        mkdir (dir, 0755);
+
         if (!(dp = opendir (dir)))
         {
-            ErrorF ("failed: open'%s'\n", dir);
+            ErrorF ("failed: open'%s' (%s)\n", dir, strerror(errno));
             return;
         }
         else
@@ -662,10 +761,18 @@ secUtilFlushDump (void *d)
             if (cur->bo)
             {
                 char file[128];
-
                 snprintf (file, sizeof(file), "%s/%s", dir, cur->file);
 
-                if (cur->dump_bmp)
+                if (cur->dump_format == DUMP_RAW)
+                {
+                    tbm_bo_handle handle = tbm_bo_map (cur->bo, TBM_DEVICE_CPU, TBM_OPTION_READ);
+                    XDBG_GOTO_IF_FAIL (handle.ptr != NULL, reset_dump);
+
+                    secUtilDumpRaw (file, handle.ptr, cur->size);
+
+                    tbm_bo_unmap (cur->bo);
+                }
+                else
                 {
                     unsigned int *p;
                     tbm_bo_handle handle = tbm_bo_map (cur->bo, TBM_DEVICE_CPU, TBM_OPTION_READ);
@@ -681,21 +788,22 @@ secUtilFlushDump (void *d)
                                 p[i + j * cur->width] = 0xFFFF00FF;
                     }
 
-                    secUtilDumpBmp (file, handle.ptr, cur->width, cur->height);
+                    if (cur->dump_format == DUMP_PNG)
+                    {
+                        secUtilDumpPng (file, handle.ptr, cur->width, cur->height);
+                    }
+                    else if (cur->dump_format == DUMP_BMP)
+                    {
+                        secUtilDumpBmp (file, handle.ptr, cur->width, cur->height);
+                    }
+                    else
+                    {
+                        XDBG_ERROR (MSEC, "Invalid dump format specified\n");
+                        goto reset_dump;
+                    }
 
                     tbm_bo_unmap (cur->bo);
                 }
-                else
-                {
-                    tbm_bo_handle handle = tbm_bo_map (cur->bo, TBM_DEVICE_CPU, TBM_OPTION_READ);
-                    XDBG_GOTO_IF_FAIL (handle.ptr != NULL, reset_dump);
-
-                    secUtilDumpRaw (file, handle.ptr, cur->size);
-
-                    tbm_bo_unmap (cur->bo);
-                }
-
-                XDBG_ERROR (MSEC, "%s saved\n", file);
             }
 
 reset_dump:
@@ -710,7 +818,7 @@ reset_dump:
             memset (&cur->rect, 0, sizeof (xRectangle));
             cur->file[0] = '\0';
             cur->dirty = FALSE;
-            cur->dump_bmp = FALSE;
+            cur->dump_format = DUMP_PNG;
         }
     }
 }
@@ -819,11 +927,16 @@ int secUtilRotateAdd (int rot_a, int rot_b)
 void
 secUtilCacheFlush (ScrnInfoPtr scrn)
 {
+#ifdef LEGACY_INTERFACE
     struct drm_exynos_gem_cache_op cache_op;
     SECPtr pSec;
     int ret;
+    static int success = TRUE;
 
     XDBG_RETURN_IF_FAIL (scrn != NULL);
+
+    if (!success)
+        return;
 
     pSec = SECPTR (scrn);
 
@@ -835,8 +948,12 @@ secUtilCacheFlush (ScrnInfoPtr scrn)
     ret = drmCommandWriteRead (pSec->drm_fd, DRM_EXYNOS_GEM_CACHE_OP,
                                &cache_op, sizeof(cache_op));
     if (ret)
+    {
         xf86DrvMsg (scrn->scrnIndex, X_ERROR,
                     "cache flush failed. (%s)\n", strerror(errno));
+        success = FALSE;
+    }
+#endif
 }
 
 const PropertyPtr
@@ -1350,7 +1467,7 @@ CANT_CONVERT:
 }
 
 void
-secUtilFreeHandle (ScrnInfoPtr scrn, unsigned int handle)
+secUtilFreeHandle (ScrnInfoPtr scrn, uint32_t handle)
 {
     struct drm_gem_close close;
     SECPtr pSec;
@@ -1367,6 +1484,7 @@ secUtilFreeHandle (ScrnInfoPtr scrn, unsigned int handle)
     }
 }
 
+#ifdef LEGACY_INTERFACE
 Bool
 secUtilConvertPhyaddress (ScrnInfoPtr scrn, unsigned int phy_addr, int size,
                           unsigned int *handle)
@@ -1428,11 +1546,12 @@ secUtilConvertHandle (ScrnInfoPtr scrn, unsigned int handle,
 
     return TRUE;
 }
+#endif
 
 typedef struct _ListData
 {
     void *key;
-    void *data;
+    uniType data;
 
     struct xorg_list link;
 } ListData;
@@ -1454,7 +1573,7 @@ _secUtilListGet (void *list, void *key)
 }
 
 void*
-secUtilListAdd (void *list, void *key, void *user_data)
+secUtilListAdd (void *list, void *key, uniType user_data)
 {
     ListData *data;
 
@@ -1471,6 +1590,8 @@ secUtilListAdd (void *list, void *key, void *user_data)
         return list;
 
     data = malloc (sizeof (ListData));
+    XDBG_RETURN_VAL_IF_FAIL (data != NULL, NULL);
+
     data->key = key;
     data->data = user_data;
 
@@ -1502,18 +1623,18 @@ secUtilListRemove (void *list, void *key)
     return list;
 }
 
-void*
+uniType
 secUtilListGetData (void *list, void *key)
 {
     ListData *data;
-
-    XDBG_RETURN_VAL_IF_FAIL (key != NULL, NULL);
+    uniType ret = {0};
+    XDBG_RETURN_VAL_IF_FAIL (key != NULL, ret);
 
     data = _secUtilListGet (list, key);
     if (data)
-        return data->data;
+        ret = data->data;
 
-    return NULL;
+    return ret;
 }
 
 Bool
@@ -1659,8 +1780,13 @@ static SECFormatTable format_table[] =
 {
     { FOURCC_RGB565, DRM_FORMAT_RGB565,    TYPE_RGB    },
     { FOURCC_SR16,   DRM_FORMAT_RGB565,    TYPE_RGB    },
+#ifdef LEGACY_INTERFACE
     { FOURCC_RGB32,  DRM_FORMAT_XRGB8888,  TYPE_RGB    },
     { FOURCC_SR32,   DRM_FORMAT_XRGB8888,  TYPE_RGB    },
+#else
+    { FOURCC_RGB32,  DRM_FORMAT_ARGB8888,  TYPE_RGB    },
+    { FOURCC_SR32,   DRM_FORMAT_ARGB8888,  TYPE_RGB    },
+#endif
     { FOURCC_YV12,   DRM_FORMAT_YVU420,    TYPE_YUV420 },
     { FOURCC_I420,   DRM_FORMAT_YUV420,    TYPE_YUV420 },
     { FOURCC_S420,   DRM_FORMAT_YUV420,    TYPE_YUV420 },
@@ -1803,7 +1929,7 @@ _secUtilAllocSecureBuffer (ScrnInfoPtr scrn, int size, int flags)
     arg_flink.handle = arg_handle.handle;
     if (drmIoctl (pSec->drm_fd, DRM_IOCTL_GEM_FLINK, &arg_flink))
     {
-        XDBG_ERRNO (MVBUF, "failed : flink gem (%ld)\n", arg_handle.handle);
+        XDBG_ERRNO (MVBUF, "failed : flink gem (%lu)\n", (unsigned long) arg_handle.handle);
         goto done_secure_buffer;
     }
     XDBG_GOTO_IF_FAIL (arg_flink.name > 0, done_secure_buffer);
@@ -1816,7 +1942,7 @@ done_secure_buffer:
     {
         arg_close.handle = arg_handle.handle;
         if (drmIoctl (pSec->drm_fd, DRM_IOCTL_GEM_CLOSE, &arg_close))
-            XDBG_ERRNO (MVBUF, "failed : close gem (%ld)\n", arg_handle.handle);
+            XDBG_ERRNO (MVBUF, "failed : close gem (%lu)\n", (unsigned long) arg_handle.handle);
     }
 
     if (tzmem_get.fd >= 0)
@@ -1915,7 +2041,7 @@ secUtilGetColorType (unsigned int id)
 }
 
 static SECVideoBuf*
-_findVideoBuffer (CARD32 stamp)
+_findVideoBuffer (uintptr_t stamp)
 {
     SECVideoBuf *cur = NULL, *next = NULL;
 
@@ -1942,7 +2068,7 @@ _secUtilAllocVideoBuffer (ScrnInfoPtr scrn, int id, int width, int height,
     int flags = 0;
     int i;
     tbm_bo_handle bo_handle;
-    CARD32 stamp;
+    uintptr_t stamp;
 
     XDBG_RETURN_VAL_IF_FAIL (scrn != NULL, NULL);
     XDBG_RETURN_VAL_IF_FAIL (id > 0, NULL);
@@ -1970,7 +2096,10 @@ _secUtilAllocVideoBuffer (ScrnInfoPtr scrn, int id, int width, int height,
         int alloc_size = 0;
 
         if (id == FOURCC_SN12 || id == FOURCC_SN21 || id == FOURCC_ST12)
+        {
             alloc_size = vbuf->lengths[i];
+            vbuf->offsets[i] = 0;
+        }
         else if (i == 0)
             alloc_size = vbuf->size;
 
@@ -2005,8 +2134,10 @@ _secUtilAllocVideoBuffer (ScrnInfoPtr scrn, int id, int width, int height,
         vbuf->handles[i] = bo_handle.u32;
         XDBG_GOTO_IF_FAIL (vbuf->handles[i] > 0, alloc_fail);
 
+#ifdef LEGACY_INTERFACE
         if (scanout)
             secUtilConvertHandle (scrn, vbuf->handles[i], &vbuf->phy_addrs[i], NULL);
+#endif
 
         XDBG_DEBUG (MVBUF, "handle(%d) => phy_addrs(%d) \n", vbuf->handles[i], vbuf->phy_addrs[i]);
     }
@@ -2023,7 +2154,7 @@ _secUtilAllocVideoBuffer (ScrnInfoPtr scrn, int id, int width, int height,
     _secUtilInitVbuf ();
     xorg_list_add (&vbuf->valid_link, &vbuf_lists);
 
-    stamp = GetTimeInMillis ();
+    stamp = (uintptr_t) GetTimeInMillis ();
     while (_findVideoBuffer (stamp))
         stamp++;
     vbuf->stamp = stamp;
@@ -2031,8 +2162,10 @@ _secUtilAllocVideoBuffer (ScrnInfoPtr scrn, int id, int width, int height,
     vbuf->func = strdup (func);
     vbuf->flags = flags;
     vbuf->scanout = scanout;
+    vbuf->vblank_handler = NULL;
+    vbuf->vblank_user_data = NULL;
 
-    XDBG_DEBUG (MVBUF, "%ld alloc(flags:%x, scanout:%d): %s\n", vbuf->stamp, flags, scanout, func);
+    XDBG_DEBUG (MVBUF, "%"PRIuPTR" alloc(flags:%x, scanout:%d): %s\n", vbuf->stamp, flags, scanout, func);
 
     return vbuf;
 
@@ -2052,7 +2185,7 @@ SECVideoBuf*
 _secUtilCreateVideoBuffer (ScrnInfoPtr scrn, int id, int width, int height, Bool secure, const char *func)
 {
     SECVideoBuf *vbuf = NULL;
-    CARD32 stamp;
+    uintptr_t stamp;
 
     XDBG_RETURN_VAL_IF_FAIL (scrn != NULL, NULL);
     XDBG_RETURN_VAL_IF_FAIL (id > 0, NULL);
@@ -2083,15 +2216,17 @@ _secUtilCreateVideoBuffer (ScrnInfoPtr scrn, int id, int width, int height, Bool
     _secUtilInitVbuf ();
     xorg_list_add (&vbuf->valid_link, &vbuf_lists);
 
-    stamp = GetTimeInMillis ();
+    stamp = (uintptr_t) GetTimeInMillis ();
     while (_findVideoBuffer (stamp))
         stamp++;
     vbuf->stamp = stamp;
 
     vbuf->func = strdup (func);
     vbuf->flags = -1;
+    vbuf->vblank_handler = NULL;
+    vbuf->vblank_user_data = NULL;
 
-    XDBG_DEBUG (MVBUF, "%ld create: %s\n", vbuf->stamp, func);
+    XDBG_DEBUG (MVBUF, "%"PRIuPTR" create: %s\n", vbuf->stamp, func);
 
     return vbuf;
 
@@ -2103,7 +2238,7 @@ alloc_fail:
 }
 
 SECVideoBuf*
-secUtilVideoBufferRef (SECVideoBuf *vbuf)
+_secUtilVideoBufferRef (SECVideoBuf *vbuf, const char *func)
 {
     if (!vbuf)
         return NULL;
@@ -2111,8 +2246,90 @@ secUtilVideoBufferRef (SECVideoBuf *vbuf)
     XDBG_RETURN_VAL_IF_FAIL (VBUF_IS_VALID (vbuf), NULL);
 
     vbuf->ref_cnt++;
+    XDBG_DEBUG (MVBUF, "%ld ref(%d) %s\n", vbuf->stamp, vbuf->ref_cnt, func);
 
     return vbuf;
+}
+
+SECVideoBuf*
+secUtilCreateVideoBufferByDraw (DrawablePtr pDraw)
+{
+    SECVideoBuf *vbuf = NULL;
+    PixmapPtr pPixmap = NULL;
+    tbm_bo_handle bo_handle;
+    SECPixmapPriv *privPixmap;
+    Bool need_finish = FALSE;
+
+    XDBG_GOTO_IF_FAIL (pDraw != NULL, fail_get);
+
+
+    if (pDraw->type == DRAWABLE_WINDOW)
+        pPixmap = pDraw->pScreen->GetWindowPixmap ((WindowPtr) pDraw);
+    else
+        pPixmap = (PixmapPtr) pDraw;
+    XDBG_GOTO_IF_FAIL (pPixmap != NULL, fail_get);
+
+    privPixmap = exaGetPixmapDriverPrivate (pPixmap);
+    XDBG_GOTO_IF_FAIL (privPixmap != NULL, fail_get);
+
+    if (!privPixmap->bo)
+    {
+        need_finish = TRUE;
+        secExaPrepareAccess (pPixmap, EXA_PREPARE_DEST);
+        XDBG_GOTO_IF_FAIL (privPixmap->bo != NULL, fail_get);
+    }
+
+	/*
+	 * Xserver or DDX can create a buffer object and pitch for an any drawable 
+	 * bigger then user has requested for improvement performance or
+	 * for something else (it depends). So a video buffer width should depend 
+	 * on a pitch of a pixmap but not width.
+	 */
+    int width = pPixmap->devKind / (pPixmap->drawable.bitsPerPixel >> 3);
+
+    vbuf = secUtilCreateVideoBuffer (secUtilDrawToScrn(pDraw), FOURCC_RGB32,
+                                     width, pPixmap->drawable.height, FALSE);
+
+    XDBG_GOTO_IF_FAIL (vbuf != NULL, fail_get);
+
+    vbuf->bo[0] = NULL;
+    bo_handle = tbm_bo_get_handle (privPixmap->bo, TBM_DEVICE_DEFAULT);
+    vbuf->handles[0] = bo_handle.u32;
+
+
+    XDBG_DEBUG(MVBUF, "draw:%dx%d+%d+%d; pix:%dx%d+%d+%d: vbuff->pitche:%d: pPixmap->devKind:%d\n",
+               pDraw->width, pDraw->height, pDraw->x, pDraw->y,
+               pPixmap->drawable.width, pPixmap->drawable.height, pPixmap->drawable.x, pPixmap->drawable.y,
+               vbuf->pitches[0], pPixmap->devKind);
+
+    /*
+     * If "bo" has "bo_user_data" we should use fb_id from it,
+     * otherwise fb will be created later after the secLayerSetVbuf() will be called.
+     */
+    SECFbBoDataPtr bo_data = NULL;
+    
+    int ret = tbm_bo_get_user_data (privPixmap->bo, TBM_BO_DATA_FB, (void * *)&bo_data);
+    if (ret && bo_data != NULL)
+    {
+        vbuf->fb_id = bo_data->fb_id;
+        vbuf->fb_id_external = TRUE;
+    }
+
+    if (need_finish)
+        secExaFinishAccess (pPixmap, EXA_PREPARE_DEST);
+
+    XDBG_GOTO_IF_FAIL (vbuf->handles[0] > 0, fail_get);
+
+    return vbuf;
+
+fail_get:
+    if (pPixmap && need_finish)
+        secExaFinishAccess (pPixmap, EXA_PREPARE_DEST);
+
+    if (vbuf)
+        secUtilVideoBufferUnref (vbuf);
+
+    return NULL;
 }
 
 void
@@ -2122,6 +2339,8 @@ _secUtilVideoBufferUnref (SECVideoBuf *vbuf, const char *func)
         return;
 
     VBUF_RETURN_IF_FAIL (_secUtilIsVbufValid (vbuf, func));
+
+    XDBG_DEBUG (MVBUF, "%ld unref(cnt:%d): %s\n", vbuf->stamp, vbuf->ref_cnt, func);
 
     vbuf->ref_cnt--;
     if (vbuf->ref_cnt == 0)
@@ -2156,15 +2375,15 @@ _secUtilFreeVideoBuffer (SECVideoBuf *vbuf, const char *func)
             tbm_bo_unref (vbuf->bo[i]);
     }
 
-    if (vbuf->fb_id > 0)
+    if (vbuf->fb_id > 0 && !vbuf->fb_id_external)
     {
-        XDBG_DEBUG (MVBUF, "vbuf(%ld) fb_id(%d) removed. \n", vbuf->stamp, vbuf->fb_id);
+        XDBG_DEBUG (MVBUF, "vbuf(%"PRIuPTR") fb_id(%"PRIdPTR") removed. \n", vbuf->stamp, vbuf->fb_id);
         drmModeRmFB (SECPTR(vbuf->pScrn)->drm_fd, vbuf->fb_id);
     }
 
     xorg_list_del (&vbuf->valid_link);
 
-    XDBG_DEBUG (MVBUF, "%ld freed: %s\n", vbuf->stamp, func);
+    XDBG_DEBUG (MVBUF, "%"PRIuPTR" freed: %s\n", vbuf->stamp, func);
 
     vbuf->stamp = 0;
 
@@ -2331,7 +2550,7 @@ secUtilDumpVideoBuffer (char *reply, int *len)
 
     xorg_list_for_each_entry_safe (cur, next, &vbuf_lists, valid_link)
     {
-        XDBG_REPLY ("%d\t(%dx%d,%d)\t%c%c%c%c\t%d\t%d\t%d\t%ld\t%s\n",
+        XDBG_REPLY ("%"PRIdPTR"\t(%dx%d,%d)\t%c%c%c%c\t%d\t%d\t%d\t%"PRIuPTR"\t%s\n",
                     cur->fb_id, cur->width, cur->height, cur->size,
                     FOURCC_STR (cur->id),
                     cur->flags, cur->ref_cnt, cur->secure, cur->stamp, cur->func);
@@ -2340,3 +2559,46 @@ secUtilDumpVideoBuffer (char *reply, int *len)
     return reply;
 }
 
+int findActiveConnector (ScrnInfoPtr pScrn)
+{
+    xf86CrtcConfigPtr pXf86CrtcConfig;
+    xf86OutputPtr pOutput;
+    int actv_connector = -1, i;
+
+    pXf86CrtcConfig = XF86_CRTC_CONFIG_PTR (pScrn);
+
+    for ( i = 0; i < pXf86CrtcConfig->num_output; i++)
+    {
+        if (pXf86CrtcConfig->output[i]->status == XF86OutputStatusConnected)
+        {
+            pOutput = pXf86CrtcConfig->output[i];
+            if (!strcmp(pOutput->name, "LVDS1"))
+            {
+                actv_connector = DRM_MODE_CONNECTOR_LVDS;
+                break;
+            }else if (!strcmp(pOutput->name, "HDMI1"))
+            {
+                actv_connector = DRM_MODE_CONNECTOR_HDMIA;
+            }else if (!strcmp(pOutput->name, "Virtual1"))
+            {
+                actv_connector = DRM_MODE_CONNECTOR_VIRTUAL;
+            }
+
+        }
+    }
+  return actv_connector;
+}
+
+ScrnInfoPtr
+secUtilDrawToScrn(DrawablePtr pDraw)
+{
+    XDBG_RETURN_VAL_IF_FAIL(pDraw, NULL);
+    return xf86Screens[pDraw->pScreen->myNum];
+}
+
+uniType
+setunitype32(uint32_t data_u32)
+{
+    uniType temp = {.u32 = data_u32};
+    return temp;
+}

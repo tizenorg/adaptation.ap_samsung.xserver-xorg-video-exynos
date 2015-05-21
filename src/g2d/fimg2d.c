@@ -1,3 +1,4 @@
+#include <xorg-server.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -5,9 +6,10 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
+#include <xorg-server.h>
 #include "xf86drm.h"
 #include "xf86drmMode.h"
-#include "exynos_drm.h"
+#include <exynos/exynos_drm.h>
 #include "fimg2d.h"
 #include "sec_util.h"
 
@@ -15,7 +17,7 @@
 #define TRUE 1
 #endif
 #ifndef FALSE
-#define FALSE 1
+#define FALSE 0
 #endif
 
 #define G2D_MAX_CMD 64
@@ -48,6 +50,7 @@ _g2d_clear(void)
 int
 g2d_init (int fd)
 {
+#ifdef LEGACY_INTERFACE
     int ret;
     struct drm_exynos_g2d_get_ver ver;
 
@@ -71,13 +74,20 @@ g2d_init (int fd)
     XDBG_INFO (MG2D, "[G2D] version(%d.%d) init....OK\n", gCtx->major, gCtx->minor);
 
     return TRUE;
+#else
+        XDBG_ERROR (MG2D, "need to check g2d functionality\n");
+        gCtx = NULL;
+        return FALSE;
+#endif
 }
 
 void
 g2d_fini (void)
 {
+#ifdef LEGACY_INTERFACE
     free(gCtx);
     gCtx = NULL;
+#endif
 }
 
 int
@@ -152,6 +162,7 @@ g2d_exec (void)
 int
 g2d_flush (void)
 {
+#ifdef LEGACY_INTERFACE
     int ret;
     struct drm_exynos_g2d_set_cmdlist cmdlist;
 
@@ -184,6 +195,9 @@ g2d_flush (void)
 
     gCtx->cmdlist_nr++;
     return TRUE;
+#else
+    return FALSE;
+#endif
 }
 
 G2dImage*
@@ -356,6 +370,7 @@ G2dImage*
 g2d_image_create_data (G2dColorMode format, unsigned int width, unsigned int height,
                                             void* data, unsigned int stride)
 {
+#ifdef LEGACY_INTERFACE
     G2dImage* img;
 
     img = g2d_image_new();
@@ -455,6 +470,9 @@ g2d_image_create_data (G2dColorMode format, unsigned int width, unsigned int hei
     }
 
     return img;
+#else
+    return NULL;
+#endif
 }
 
 void

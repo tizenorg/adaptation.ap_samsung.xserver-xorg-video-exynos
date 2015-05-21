@@ -33,6 +33,13 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include "sec_display.h"
 
+#ifndef RR_Rotate_All
+#define RR_Rotate_All  (RR_Rotate_0|RR_Rotate_90|RR_Rotate_180|RR_Rotate_270)
+#endif //RR_Rotate_All
+#ifndef RR_Reflect_All
+#define RR_Reflect_All (RR_Reflect_X|RR_Reflect_Y)
+#endif //RR_Reflect_All
+
 typedef struct _secOutputPriv
 {
     SECModePtr pSecMode;
@@ -49,10 +56,12 @@ typedef struct _secOutputPriv
     int disp_mode;
 
     xf86OutputPtr pOutput;
+    Bool is_dummy;
     struct xorg_list link;
 } SECOutputPrivRec, *SECOutputPrivPtr;
-
-
+#if 0
+Bool    secOutputDummyInit  (ScrnInfoPtr pScrn, SECModePtr pSecMode, Bool late);
+#endif
 void    secOutputInit       (ScrnInfoPtr pScrn, SECModePtr pSecMode, int num);
 int     secOutputDpmsStatus (xf86OutputPtr pOutput);
 void    secOutputDpmsSet    (xf86OutputPtr pOutput, int mode);

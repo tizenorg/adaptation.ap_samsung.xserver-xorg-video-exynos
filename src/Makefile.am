@@ -1,8 +1,8 @@
-AM_CFLAGS = -I@top_srcdir@/src @XORG_CFLAGS@ @EXYNOS_CFLAGS@
+AM_CFLAGS = -I@top_srcdir@/src @XORG_CFLAGS@ @EXYNOS_CFLAGS@ @TTRACE_CFLAGS@
 exynos_drv_la_LTLIBRARIES = exynos_drv.la
 #exynos_drv_la_LDFLAGS = -module -avoid-version @EXYNOS_LIBS@
 exynos_drv_la_LDFLAGS = -module -avoid-version
-exynos_drv_la_LIBADD = @EXYNOS_LIBS@
+exynos_drv_la_LIBADD = @EXYNOS_LIBS@ @TTRACE_LIBS@
 exynos_drv_ladir = @moduledir@/drivers
 
 # common
@@ -17,7 +17,9 @@ exynos_drv_la_SOURCES += \
 	crtcconfig/sec_layer.c \
 	crtcconfig/sec_prop.c \
 	crtcconfig/sec_xberc.c \
-	crtcconfig/sec_display.c
+	crtcconfig/sec_display.c \
+	crtcconfig/sec_dummy.c \
+	crtcconfig/sec_layer_manager.c
 AM_CFLAGS += -I@top_srcdir@/src/crtcconfig
 
 # accel
@@ -27,17 +29,24 @@ exynos_drv_la_SOURCES += \
 	accel/sec_dri2.c
 AM_CFLAGS += -I@top_srcdir@/src/accel
 
+if ENABLE_DRI3_PRESENT
+exynos_drv_la_SOURCES += \
+	accel/sec_present.c \
+	accel/sec_dri3.c
+endif
+
 # xv
 exynos_drv_la_SOURCES += \
 	xv/sec_video_tvout.c \
 	xv/sec_video_virtual.c \
 	xv/sec_video_display.c \
+	xv/sec_video_clone.c \
 	xv/sec_video.c
 AM_CFLAGS += -I@top_srcdir@/src/xv
 
 # util
 exynos_drv_la_SOURCES += \
-	util/sec_util.c 
+	util/sec_util.c
 AM_CFLAGS += -I@top_srcdir@/src/util
 
 # debug
@@ -69,3 +78,18 @@ exynos_drv_la_SOURCES += \
         g2d/fimg2d.c \
         g2d/util_g2d.c
 AM_CFLAGS += -I@top_srcdir@/src/g2d
+
+# hwc
+if ENABLE_HWC
+exynos_drv_la_SOURCES += \
+        hwc/sec_hwc.c
+endif         
+AM_CFLAGS += -I@top_srcdir@/src/hwc
+
+# hwa
+if ENABLE_HWA
+exynos_drv_la_SOURCES += \
+        hwa/sec_hwa.c
+endif
+AM_CFLAGS += -I@top_srcdir@/src/hwa
+

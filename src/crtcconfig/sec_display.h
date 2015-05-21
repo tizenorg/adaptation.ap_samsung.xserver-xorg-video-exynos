@@ -48,8 +48,10 @@ typedef enum
 typedef enum
 {
     DISPLAY_CONN_MODE_NONE,
+    DISPLAY_CONN_MODE_LVDS,
     DISPLAY_CONN_MODE_HDMI,
     DISPLAY_CONN_MODE_VIRTUAL,
+    DISPLAY_CONN_MODE_DUMMY,
     DISPLAY_CONN_MODE_MAX,
 } SECDisplayConnMode;
 
@@ -58,6 +60,8 @@ typedef enum
     VBLNAK_INFO_NONE,
     VBLANK_INFO_SWAP,
     VBLANK_INFO_PLANE,
+    VBLANK_INFO_PRESENT,
+    VBLANK_INFO_PAGE_FLIP,
     VBLANK_INFO_MAX
 } SECVBlankInfoType;
 
@@ -103,13 +107,21 @@ typedef struct _secDrmMode
     struct xorg_list outputs;
     struct xorg_list crtcs;
     struct xorg_list planes;
-
+#ifdef NO_CRTC_MODE
+    int num_dummy_output;
+    int num_real_output;
+    int num_real_crtc;
+    int num_dummy_crtc;
+#endif
     SECDisplaySetMode  set_mode;
     SECDisplayConnMode conn_mode;
     int                rotate;
 
     int unset_connector_type;
 } SECModeRec, *SECModePtr;
+
+typedef void (*SECFlipEventHandler) (unsigned int frame, unsigned int tv_exynos,
+				 unsigned int tv_uexynos, void *event_data, Bool flip_failed);
 
 typedef struct _secPageFlip
 {
@@ -120,9 +132,12 @@ typedef struct _secPageFlip
 
     tbm_bo back_bo;
     tbm_bo accessibility_back_bo;
+    int fb_id;
 
     void *data;
     CARD32 time;
+
+    SECFlipEventHandler handler;
 
 #if DBG_DRM_EVENT
     void *xdbg_log_pageflip;
@@ -153,7 +168,7 @@ void        secModeInit (ScrnInfoPtr pScrn);
 void        secModeDeinit (ScrnInfoPtr pScrn);
 xf86CrtcPtr secModeCoveringCrtc (ScrnInfoPtr pScrn, BoxPtr pBox, xf86CrtcPtr pDesiredCrtc, BoxPtr pBoxCrtc);
 int         secModeGetCrtcPipe (xf86CrtcPtr pCrtc);
-Bool        secModePageFlip (ScrnInfoPtr pScrn, xf86CrtcPtr pCrtc, void* flip_info, int pipe, tbm_bo back_bo);
+Bool        secModePageFlip (ScrnInfoPtr pScrn, xf86CrtcPtr pCrtc, void* flip_info, int pipe, tbm_bo back_bo, RegionPtr pFlipRegion, unsigned int client_idx, XID drawable_id, SECFlipEventHandler handler, Bool change_front);
 void        secModeLoadPalette (ScrnInfoPtr pScrn, int numColors, int* indices, LOCO* colors, VisualPtr pVisual);
 
 void        secDisplaySwapModeFromKmode(ScrnInfoPtr pScrn, drmModeModeInfoPtr kmode, DisplayModePtr	pMode);
@@ -171,13 +186,15 @@ SECDisplayConnMode secDisplayGetDispConnMode (ScrnInfoPtr pScrn);
 Bool secDisplayInitDispMode (ScrnInfoPtr pScrn, SECDisplayConnMode conn_mode);
 void secDisplayDeinitDispMode (ScrnInfoPtr pScrn);
 
-Bool secDisplayGetCurMSC (ScrnInfoPtr pScrn, int pipe, CARD64 *ust, CARD64 *msc);
-Bool secDisplayVBlank (ScrnInfoPtr pScrn, int pipe, CARD64 *target_msc, int flip, SECVBlankInfoType type, void *vblank_info);
+Bool secDisplayGetCurMSC (ScrnInfoPtr pScrn, intptr_t pipe, CARD64 *ust, CARD64 *msc);
+Bool secDisplayVBlank (ScrnInfoPtr pScrn, intptr_t pipe, CARD64 *target_msc, intptr_t flip, SECVBlankInfoType type, void *vblank_info);
 int secDisplayDrawablePipe (DrawablePtr pDraw);
 
-int secDisplayCrtcPipe (ScrnInfoPtr pScrn, int crtc_id);
+intptr_t secDisplayCrtcPipe (ScrnInfoPtr pScrn, int crtc_id);
 
 Bool secDisplayUpdateRequest(ScrnInfoPtr pScrn);
-
+#ifdef NO_CRTC_MODE
+Bool secDisplayChangeMode (ScrnInfoPtr pScrn);
+#endif
 #endif /* __SEC_DISPLAY_H__ */
 

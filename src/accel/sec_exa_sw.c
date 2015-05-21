@@ -169,7 +169,7 @@ static OpDFS gOpDFS;
 
 ExaBox* _swBoxAdd (struct xorg_list *l, BoxPtr b1, BoxPtr b2)
 {
-    ExaBox* rgn;
+    ExaBox* rgn = NULL;
 
     rgn = calloc (1, sizeof (ExaBox));
     rgn->state = secUtilBoxIntersect (&rgn->box, b1, b2);
@@ -256,11 +256,9 @@ static ExaOpInfo* _swPrepareAccess (PixmapPtr pPix, int index)
     SECPixmapPriv *privPixmap = (SECPixmapPriv*)exaGetPixmapDriverPrivate (pPix);
     ExaOpInfo* op = &OpInfo[index];
     int opt = TBM_OPTION_READ;
-    int i;
     tbm_bo *bos;
     tbm_bo_handle bo_handle;
-    SECFbBoDataPtr bo_data;
-    int num_bo;
+    int num_bo = 0;
     int ret;
 
     XDBG_RETURN_VAL_IF_FAIL ((privPixmap != NULL), NULL);
@@ -312,6 +310,19 @@ static ExaOpInfo* _swPrepareAccess (PixmapPtr pPix, int index)
         }
         else
         {
+
+#ifdef NO_CRTC_MODE
+            if (num_bo == 0)
+            {
+                num_bo = 1;
+                bos = (tbm_bo *)calloc(1, sizeof(tbm_bo));
+                bos[0] = pSec->pFb->default_bo;
+            }
+#endif //NO_CRTC_MODE
+#if 0
+            int i;
+            SECFbBoDataPtr bo_data;
+
             op->num = num_bo;
             op->isSame = 0;
 
@@ -325,6 +336,7 @@ static ExaOpInfo* _swPrepareAccess (PixmapPtr pPix, int index)
                 op->buf[i].pixmap->devPrivate.ptr = op->buf[i].addr;
                 op->buf[i].pos = bo_data->pos;
             }
+#endif
         }
 
         if (bos)
@@ -476,7 +488,16 @@ _swDoCopy (ExaBox* box, void* data)
                 box->box.x2,
                 box->box.y2,
                 gOpCopy.srcX,
-                gOpCopy.srcY);
+                gOpCopy.srcY,
+                gOpCopy.dstX,
+                gOpCopy.dstY);
+
+    if (gOpCopy.srcX < 0 || gOpCopy.srcY < 0 || gOpCopy.dstX < 0 || gOpCopy.dstY < 0)
+    {
+        XDBG_WARNING(MEXAS, "Sikp copy srcX:%d srcY:%d dstX:%d dstY:%d\n",
+                    gOpCopy.srcX, gOpCopy.srcY, gOpCopy.dstX, gOpCopy.dstY);
+        return;
+    }
 
     srcX = gOpCopy.srcX + box->box.x1 - box->pSrc->pos.x1;
     srcY = gOpCopy.srcY + box->box.y1 - box->pSrc->pos.y1;
@@ -715,7 +736,7 @@ SECExaSwPrepareSolid (PixmapPtr pPixmap, int alu, Pixel planemask, Pixel fg)
 
 bail:
     XDBG_TRACE (MEXAS, "FAIL: pix:%p hint:%d, num_pix:%d\n",
-                pPixmap, index, pPixmap->usage_hint, gOpSolid.pOpDst->num);
+                pPixmap, pPixmap->usage_hint, gOpSolid.pOpDst->num);
     gOpSolid.bDo = FALSE;
     gOpSolid.pGC = NULL;
 
@@ -823,10 +844,10 @@ SECExaSwPrepareCopy (PixmapPtr pSrcPixmap, PixmapPtr pDstPixmap,
 
 bail:
     XDBG_TRACE (MEXAS, "FAIL\n");
-    XDBG_TRACE (MEXAS, "   SRC pix:%p, index:%d, hint:%d, num_pix:%d\n",
-                pSrcPixmap, index, pSrcPixmap->usage_hint, num_src_pix);
-    XDBG_TRACE (MEXAS, "   DST pix:%p, index:%d, hint:%d, num_pix:%d\n",
-                pDstPixmap, index, pDstPixmap->usage_hint, num_dst_pix);
+    XDBG_TRACE (MEXAS, "   SRC pix:%p, hint:%d, num_pix:%d\n",
+                pSrcPixmap, pSrcPixmap->usage_hint, num_src_pix);
+    XDBG_TRACE (MEXAS, "   DST pix:%p, hint:%d, num_pix:%d\n",
+                pDstPixmap, pDstPixmap->usage_hint, num_dst_pix);
     gOpCopy.bDo = FALSE;
 
     return TRUE;

@@ -43,6 +43,7 @@ static unsigned int drmfmt_list[] =
     /* packed */
     DRM_FORMAT_RGB565,
     DRM_FORMAT_XRGB8888,
+    DRM_FORMAT_ARGB8888,
     DRM_FORMAT_YUYV,
     DRM_FORMAT_UYVY,
 
@@ -94,6 +95,7 @@ secDrmIppSetProperty (ScrnInfoPtr pScrn, struct drm_exynos_ipp_property *propert
                 property->config[1].sz.hsize, property->config[1].sz.vsize,
                 property->config[1].pos.x, property->config[1].pos.y, property->config[1].pos.w, property->config[1].pos.h);
 
+#ifdef LEGACY_INTERFACE
 #ifdef _F_WEARABLE_FEATURE_
     XDBG_DEBUG (MDRM, "cmd(%d) type(%d) ipp_id(%d) prop_id(%d) hz(%d) protect(%d) range(%d) blending(%x)\n",
                 property->cmd, property->type, property->ipp_id, property->prop_id, property->refresh_rate,
@@ -102,6 +104,11 @@ secDrmIppSetProperty (ScrnInfoPtr pScrn, struct drm_exynos_ipp_property *propert
     XDBG_DEBUG (MDRM, "cmd(%d) ipp_id(%d) prop_id(%d) hz(%d) protect(%d) range(%d)\n",
                 property->cmd, property->ipp_id, property->prop_id, property->refresh_rate,
                 property->protect, property->range);
+#endif
+#else
+    XDBG_DEBUG (MDRM, "cmd(%d) ipp_id(%d) prop_id(%d) hz(%d) range(%d)\n",
+                property->cmd, property->ipp_id, property->prop_id, property->refresh_rate,
+                property->range);
 #endif
 
     ret = ioctl (SECPTR (pScrn)->drm_fd, DRM_IOCTL_EXYNOS_IPP_SET_PROPERTY, property);

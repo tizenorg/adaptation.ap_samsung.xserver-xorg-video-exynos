@@ -54,20 +54,20 @@ void   secPlaneInit (ScrnInfoPtr pScrn, SECModePtr pSecMode, int num);
 void   secPlaneDeinit (ScrnInfoPtr pScrn, SECPlanePrivPtr pPlanePriv);
 
 void   secPlaneShowAll (int crtc_id);
-int    secPlaneGetID   (void);
-void   secPlaneFreeId  (int plane_id);
-Bool   secPlaneTrun    (int plane_id, Bool onoff, Bool user);
-Bool   secPlaneTrunStatus (int plane_id);
-void   secPlaneFreezeUpdate (int plane_id, Bool enable);
+intptr_t    secPlaneGetID   (void);
+void   secPlaneFreeId  (intptr_t plane_id);
+Bool   secPlaneTrun    (intptr_t plane_id, Bool onoff, Bool user);
+Bool   secPlaneTrunStatus (intptr_t plane_id);
+void   secPlaneFreezeUpdate (intptr_t plane_id, Bool enable);
 
-Bool   secPlaneRemoveBuffer (int plane_id, int fb_id);
-int    secPlaneAddBo        (int plane_id, tbm_bo bo);
-int    secPlaneAddBuffer    (int plane_id, SECVideoBuf *vbuf);
+//Bool   secPlaneRemoveBuffer (intptr_t plane_id, int fb_id);
+int    secPlaneAddBo        (intptr_t plane_id, tbm_bo bo);
+int    secPlaneAddBuffer    (intptr_t plane_id, SECVideoBuf *vbuf);
 
-int    secPlaneGetBuffer     (int plane_id, tbm_bo bo, SECVideoBuf *vbuf);
+intptr_t    secPlaneGetBuffer     (int plane_id, tbm_bo bo, SECVideoBuf *vbuf);
 void   secPlaneGetBufferSize (int plane_id, int fb_id, int *width, int *height);
 
-Bool   secPlaneAttach     (int plane_id, int fb_id);
+Bool   secPlaneAttach     (int plane_id, int fb_id, SECVideoBuf *vbuf);
 
 Bool   secPlaneIsVisible (int plane_id);
 Bool   secPlaneHide (int plane_id);
@@ -77,6 +77,9 @@ Bool   secPlaneShow (int plane_id, int crtc_id,
                      int zpos, Bool need_update);
 
 Bool   secPlaneMove (int plane_id, int x, int y);
+void    secPlaneFlushFBId (intptr_t plane_id);
+
+int secPlaneGetCount(void);
 
 /* for debug */
 char*  secPlaneDump (char *reply, int *len);

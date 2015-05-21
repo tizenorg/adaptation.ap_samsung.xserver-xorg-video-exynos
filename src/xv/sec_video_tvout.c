@@ -43,7 +43,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "sec_prop.h"
 
 #include <sys/ioctl.h>
-#include <exynos_drm.h>
+#include <exynos/exynos_drm.h>
 #include <drm_fourcc.h>
 
 #define TVBUF_NUM  3
@@ -74,37 +74,17 @@ struct _SECVideoTv
     int          tv_height;
 
     xRectangle   tv_rect;
-
+    int          is_resized;
     unsigned int convert_id;
+    unsigned int src_id;
+    /* attributes */
+    int rotate;
+    int hflip;
+    int vflip;
+
+    SECLayerOutput output;
+
 };
-
-static Bool
-_secVieoTvCalSize (SECVideoTv* tv, int src_w, int src_h, int dst_w, int dst_h)
-{
-    float r;
-
-    if (src_w < MIN_WIDTH || src_h < MIN_HEIGHT)
-    {
-        XDBG_WARNING (MTVO, "size(%dx%d) must be more than (%dx%d).\n",
-                      src_w, src_h, MIN_WIDTH, MAX_WIDTH);
-    }
-
-    r = (float)dst_w / src_w;
-    if (r < MIN_SCALE || r > MAX_SCALE)
-    {
-        XDBG_WARNING (MTVO, "ratio_w(%f) is out of range(%f~%f).\n",
-                      r, MIN_SCALE, MAX_SCALE);
-    }
-
-    r = (float)dst_h / src_h;
-    if (r < MIN_SCALE || r > MAX_SCALE)
-    {
-        XDBG_WARNING (MTVO, "ratio_h(%d) is out of range(%f~%f).\n",
-                      r, MIN_SCALE, MAX_SCALE);
-    }
-
-    return TRUE;
-}
 
 static SECVideoBuf*
 _secVideoTvGetOutBuffer (SECVideoTv* tv, int width, int height, Bool secure)
@@ -130,14 +110,31 @@ _secVideoTvGetOutBuffer (SECVideoTv* tv, int width, int height, Bool secure)
 
             if (tv->outbuf[i] && !VBUF_IS_CONVERTING (tv->outbuf[i]) && !tv->outbuf[i]->showing)
             {
-                tv->outbuf_index = i;
-                return tv->outbuf[i];
+                if (tv->outbuf[i]->width == width &&
+                    tv->outbuf[i]->id == tv->convert_id &&
+                    tv->outbuf[i]->height == height)
+                {
+                    tv->outbuf_index = i;
+                    return tv->outbuf[i];
+                }
+                else
+                {
+                    secUtilVideoBufferUnref (tv->outbuf[i]);
+                    SECPtr pSec = SECPTR (tv->pScrn);
+                    tv->outbuf[i] = secUtilAllocVideoBuffer (tv->pScrn, tv->convert_id, width, height,
+                                                             (pSec->scanout)?TRUE:FALSE, TRUE, secure);
+                    XDBG_RETURN_VAL_IF_FAIL (tv->outbuf[i] != NULL, NULL);
+
+                    XDBG_DEBUG (MTVO, "outbuf(%p, %c%c%c%c)\n", tv->outbuf[i], FOURCC_STR (tv->convert_id));
+
+                    tv->outbuf_index = i;
+                    return tv->outbuf[i];
+                }
             }
         }
         else
         {
             SECPtr pSec = SECPTR (tv->pScrn);
-
             tv->outbuf[i] = secUtilAllocVideoBuffer (tv->pScrn, tv->convert_id, width, height,
                                                      (pSec->scanout)?TRUE:FALSE, TRUE, secure);
             XDBG_RETURN_VAL_IF_FAIL (tv->outbuf[i] != NULL, NULL);
@@ -207,12 +204,22 @@ _secVideoTvPutImageInternal (SECVideoTv *tv, SECVideoBuf *vbuf, xRectangle *rect
     XDBG_DEBUG (MTVO, "rect (%d,%d %dx%d) \n",
                 rect->x, rect->y, rect->width, rect->height);
 
-    secLayerSetRect (tv->layer, &vbuf->crop, rect);
+    xRectangle src_rect, dst_rect;
+    secLayerGetRect (tv->layer, &src_rect, &dst_rect);
 
-    if (tv->lpos == LAYER_LOWER1)
-        if (!_secVieoTvCalSize (tv, vbuf->width, vbuf->height,
-                                rect->width, rect->height))
-            return 0;
+    if (tv->is_resized == 1)
+    {
+        secLayerFreezeUpdate (tv->layer, FALSE);
+        tv->is_resized = 0;
+    }
+
+    if (memcmp (&vbuf->crop, &src_rect, sizeof (xRectangle)) ||
+        memcmp (rect, &dst_rect, sizeof (xRectangle)))
+    {
+        secLayerFreezeUpdate (tv->layer, TRUE);
+        secLayerSetRect (tv->layer, &vbuf->crop, rect);
+        secLayerFreezeUpdate (tv->layer, FALSE);
+    }
 
     ret = secLayerSetBuffer (tv->layer, vbuf);
 
@@ -244,7 +251,6 @@ _secVideoTvCvtCallback (SECCvt *cvt,
         if (tv->outbuf[i] == dst)
             break;
     XDBG_RETURN_IF_FAIL (i < tv->outbuf_num);
-
     _secVideoTvPutImageInternal (tv, dst, &tv->tv_rect);
 
     XDBG_DEBUG (MTVO, "++++++++++++++++++++++++.. \n");
@@ -255,7 +261,7 @@ secVideoTvConnect (ScrnInfoPtr pScrn, unsigned int id, SECLayerPos lpos)
 {
     SECVideoTv* tv = NULL;
     SECModePtr pSecMode;
-
+    unsigned int convert_id = FOURCC_RGB32;
     XDBG_RETURN_VAL_IF_FAIL (pScrn != NULL, NULL);
     XDBG_RETURN_VAL_IF_FAIL (lpos >= LAYER_LOWER1 && lpos <= LAYER_UPPER, NULL);
     XDBG_RETURN_VAL_IF_FAIL (id > 0, NULL);
@@ -278,20 +284,26 @@ secVideoTvConnect (ScrnInfoPtr pScrn, unsigned int id, SECLayerPos lpos)
         if (!secLayerSupport (pScrn, LAYER_OUTPUT_EXT, lpos, id))
         {
             /* used if id is not supported in case of lpos == LAYER_LOWER1. */
+            convert_id = FOURCC_SN12;
             tv->cvt = secCvtCreate (pScrn, CVT_OP_M2M);
             XDBG_GOTO_IF_FAIL (tv->cvt != NULL, fail_connect);
-
             secCvtAddCallback (tv->cvt, _secVideoTvCvtCallback, tv);
+        }
+        else
+        {
+            XDBG_DEBUG(MTVO, "Not need converting id(%c%c%c%c)\n", FOURCC_STR (id));
+            convert_id = id;
         }
     }
 
     XDBG_DEBUG (MTVO, "id(%c%c%c%c), lpos(%d)!\n", FOURCC_STR (id), lpos);
-
+    tv->output = LAYER_OUTPUT_EXT;
     tv->pScrn = pScrn;
     tv->lpos = lpos;
     tv->outbuf_index = -1;
-    tv->convert_id = FOURCC_RGB32;
+    tv->convert_id = convert_id;
     tv->outbuf_num = TVBUF_NUM;
+    tv->src_id = id;
 
     return tv;
 
@@ -303,6 +315,57 @@ fail_connect:
         free (tv);
     }
     return NULL;
+}
+
+Bool
+secVideoTvResizeOutput (SECVideoTv* tv, xRectanglePtr src, xRectanglePtr dst)
+{
+    if (tv == NULL)
+        return FALSE;
+
+    if (!secVideoTvCanDirectDrawing (tv, src->width, src->height,
+                                   dst->width, dst->height))
+    {
+        if (tv->cvt)
+        {
+            XDBG_DEBUG(MTVO, "Pause converter\n");
+            if (!secCvtPause(tv->cvt))
+            {
+                XDBG_ERROR(MTVO,"Can't pause ipp converter\n");
+                secVideoTvReCreateConverter(tv);
+            }
+        }
+        else
+        {
+            XDBG_DEBUG(MTVO, "Create new converter tasks\n");
+            secVideoTvReCreateConverter(tv);
+        }
+    }
+    else
+    {
+        if (tv->cvt)
+        {
+           XDBG_DEBUG(MTVO, "Driver can use direct drawing way.\n");
+           secCvtDestroy (tv->cvt);
+           tv->cvt = NULL;
+        }
+    }
+
+    if (tv->outbuf)
+    {
+        int i;
+        for (i = 0; i < tv->outbuf_num; i++)
+            if (tv->outbuf[i] && !VBUF_IS_CONVERTING(tv->outbuf[i]) && !tv->outbuf[i]->showing)
+            {
+                secUtilVideoBufferUnref (tv->outbuf[i]);
+                tv->outbuf[i] = NULL;
+            }
+        tv->outbuf_index = -1;
+    }
+
+    secLayerFreezeUpdate (tv->layer, TRUE);
+    tv->is_resized = 1;
+    return TRUE;
 }
 
 void
@@ -418,7 +481,10 @@ secVideoTvPutImage (SECVideoTv *tv, SECVideoBuf *vbuf, xRectangle *rect, int csc
 
     XDBG_RETURN_VAL_IF_FAIL (vbuf->handles[0] > 0, 0);
     XDBG_RETURN_VAL_IF_FAIL (vbuf->pitches[0] > 0, 0);
-
+    XDBG_RETURN_VAL_IF_FAIL (rect->width > 0, 0);
+    XDBG_RETURN_VAL_IF_FAIL (rect->height > 0, 0);
+    XDBG_RETURN_VAL_IF_FAIL (vbuf->width > 0, 0);
+    XDBG_RETURN_VAL_IF_FAIL (vbuf->height > 0, 0);
     _secVideoTvLayerEnsure (tv);
     XDBG_RETURN_VAL_IF_FAIL (tv->layer != NULL, 0);
 
@@ -468,20 +534,34 @@ secVideoTvPutImage (SECVideoTv *tv, SECVideoBuf *vbuf, xRectangle *rect, int csc
         dst_prop.crop = dst_crop;
         dst_prop.secure = vbuf->secure;
         dst_prop.csc_range = csc_range;
-
+        dst_prop.hflip = tv->hflip;
+        dst_prop.vflip = tv->vflip;
+        dst_prop.degree = tv->rotate;
         if (!secCvtEnsureSize (&src_prop, &dst_prop))
+        {
+            XDBG_ERROR(MTVO, "Can't ensure size\n");
             return 0;
+        }
 
         outbuf = _secVideoTvGetOutBuffer (tv, dst_prop.width, dst_prop.height, vbuf->secure);
         if (!outbuf)
+        {
+            XDBG_ERROR(MTVO, "Can't get outbuf\n");
             return 0;
+        }
         outbuf->crop = dst_prop.crop;
 
         if (!secCvtSetProperpty (tv->cvt, &src_prop, &dst_prop))
+        {
+            XDBG_ERROR(MTVO, "Can't set cvt property\n");
             return 0;
+        }
 
         if (!secCvtConvert (tv->cvt, vbuf, outbuf))
+        {
+            XDBG_ERROR(MTVO, "Can't start cvt\n");
             return 0;
+        }
 
         XDBG_TRACE (MTVO, "'%c%c%c%c' %dx%d (%d,%d %dx%d) => '%c%c%c%c' %dx%d (%d,%d %dx%d) convert. rect(%d,%d %dx%d)\n",
                     FOURCC_STR (vbuf->id), vbuf->width, vbuf->height,
@@ -492,9 +572,7 @@ secVideoTvPutImage (SECVideoTv *tv, SECVideoBuf *vbuf, xRectangle *rect, int csc
 
         return 1;
     }
-
     /* can show buffer to HDMI at now. */
-
     return _secVideoTvPutImageInternal (tv, vbuf, rect);
 }
 
@@ -526,4 +604,100 @@ secVideoTvSetConvertFormat (SECVideoTv *tv, unsigned int convert_id)
     tv->convert_id = convert_id;
 
     XDBG_TRACE (MTVO, "convert_id(%c%c%c%c) \n", FOURCC_STR (convert_id));
+}
+
+Bool
+secVideoTvCanDirectDrawing (SECVideoTv *tv, int src_w, int src_h, int dst_w, int dst_h)
+{
+    XDBG_RETURN_VAL_IF_FAIL(src_w > 0, FALSE);
+    XDBG_RETURN_VAL_IF_FAIL(src_h > 0, FALSE);
+    XDBG_RETURN_VAL_IF_FAIL(dst_w > 0, FALSE);
+    XDBG_RETURN_VAL_IF_FAIL(dst_h > 0, FALSE);
+    XDBG_RETURN_VAL_IF_FAIL(tv != 0, FALSE);
+    int ratio_w = 0;
+    int ratio_h = 0;
+    XDBG_DEBUG(MTVO, "tv(%p) src_w %d, src_h %d, dst_w %d, dst_h %d\n",
+               tv, src_w, src_h, dst_w, dst_h);
+    if (tv->hflip != 0 || tv->vflip != 0 || tv->rotate != 0)
+    {
+        XDBG_DEBUG(MTVO, "Can't direct draw hflip(%d), vflip(%d), rotate(%d)\n",
+                   tv->hflip, tv->vflip, tv->rotate);
+        return FALSE;
+    }
+    if (src_w >= dst_w)
+    {
+        ratio_w = src_w / dst_w;
+        if (ratio_w > 4)
+        {
+            XDBG_DEBUG(MTVO, "Can't direct draw ratio_w (1/%d) < 1/4\n", ratio_w);
+            return FALSE;
+        }
+        XDBG_DEBUG(MTVO, "ratio_w = 1/%d\n", ratio_w);
+    }
+    else if (src_w < dst_w)
+    {
+        ratio_w = dst_w / src_w;
+        if (ratio_w > 16)
+        {
+            XDBG_DEBUG(MTVO, "Can't direct draw ratio_w (%d) > 16\n", ratio_w);
+            return FALSE;
+        }
+        XDBG_DEBUG(MTVO, "ratio_w = %d\n", ratio_w);
+    }
+
+    if (src_h >= dst_h)
+    {
+        ratio_h = src_h / dst_h;
+        if (ratio_h > 4)
+        {
+            XDBG_DEBUG(MTVO, "Can't direct draw ratio_h (1/%d) < 1/4\n", ratio_w);
+            return FALSE;
+        }
+        XDBG_DEBUG(MTVO, "ratio_h = 1/%d\n", ratio_h);
+    }
+    else if (src_h < dst_h)
+    {
+        ratio_h = dst_h / src_h;
+        if (ratio_h > 16)
+        {
+            XDBG_DEBUG(MTVO, "Can't direct draw ratio_w (%d) > 16\n", ratio_w);
+            return FALSE;
+        }
+        XDBG_DEBUG(MTVO, "ratio_h = %d\n", ratio_h);
+    }
+
+    if (!secLayerSupport (tv->pScrn, tv->output, tv->lpos, tv->src_id))
+        {
+            XDBG_DEBUG(MTVO, "Can't direct draw. Layer not support. lpos(%d), src_id (%c%c%c%c)\n",
+            tv->lpos, FOURCC_STR(tv->src_id));
+            return FALSE;
+        }
+
+    XDBG_DEBUG(MTVO, "Support direct drawing\n");
+    return TRUE;
+}
+
+Bool
+secVideoTvReCreateConverter(SECVideoTv* tv)
+{
+    if (tv == NULL)
+        return FALSE;
+    if (tv->cvt)
+    {
+         secCvtDestroy (tv->cvt);
+    }
+    tv->cvt = secCvtCreate (tv->pScrn, CVT_OP_M2M);
+    XDBG_RETURN_VAL_IF_FAIL (tv->cvt != NULL, FALSE);
+    secCvtAddCallback (tv->cvt, _secVideoTvCvtCallback, tv);
+    return TRUE;
+}
+
+Bool
+secVideoTvSetAttributes(SECVideoTv* tv, int rotate, int hflip, int vflip)
+{
+    XDBG_RETURN_VAL_IF_FAIL(tv != NULL, FALSE);
+    tv->rotate = rotate;
+    tv->vflip = vflip;
+    tv->hflip = hflip;
+    return TRUE;
 }

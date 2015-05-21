@@ -32,7 +32,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define __SEC_CONVERTER_H__
 
 #include <fbdevhw.h>
-#include <exynos_drm.h>
+#include <exynos/exynos_drm.h>
 
 typedef struct _SECCvt SECCvt;
 
@@ -86,5 +86,7 @@ Bool     secCvtAddCallback    (SECCvt *cvt, CvtFunc func, void *data);
 void     secCvtRemoveCallback (SECCvt *cvt, CvtFunc func, void *data);
 
 void     secCvtHandleIppEvent (int fd, unsigned int *buf_idx, void *data, Bool error);
+Bool     secCvtPause (SECCvt *cvt);
+uintptr_t   secCvtGetStamp (SECCvt *cvt);
 
 #endif  /* __SEC_CONVERTER_H__ */

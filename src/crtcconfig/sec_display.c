@@ -55,8 +55,9 @@
 #include "sec_converter.h"
 #include "sec_util.h"
 #include "sec_xberc.h"
-
-#include <exynos_drm.h>
+#include <xf86RandR12.h>
+#include <exynos/exynos_drm.h>
+#include "sec_dummy.h"
 
 static Bool SECCrtcConfigResize(ScrnInfoPtr pScrn, int width, int height);
 static void SECModeVblankHandler(int fd, unsigned int frame, unsigned int tv_sec,
@@ -93,6 +94,8 @@ _secSetMainMode (ScrnInfoPtr pScrn, SECModePtr pSecMode)
     {
         xf86OutputPtr pOutput = pXf86CrtcConfig->output[i];
         SECOutputPrivPtr pOutputPriv = pOutput->driver_private;
+        if (!pOutputPriv)
+            continue;
         if (pOutputPriv->mode_output->connector_type == DRM_MODE_CONNECTOR_LVDS ||
             pOutputPriv->mode_output->connector_type == DRM_MODE_CONNECTOR_Unknown)
         {
@@ -100,7 +103,13 @@ _secSetMainMode (ScrnInfoPtr pScrn, SECModePtr pSecMode)
             return 1;
         }
     }
-
+    if (pSecMode->main_lcd_mode.hdisplay == 0 ||
+        pSecMode->main_lcd_mode.vdisplay == 0)
+    {
+        pSecMode->main_lcd_mode.hdisplay = 640;
+        pSecMode->main_lcd_mode.vdisplay = 480;
+        return 1;
+    }
     return -1;
 }
 
@@ -132,8 +141,8 @@ _saveFrameBuffer (ScrnInfoPtr pScrn, tbm_bo bo, int w, int h)
     tbm_bo_get_user_data (bo, TBM_BO_DATA_FB, (void * *)&bo_data);
     XDBG_RETURN_IF_FAIL(bo_data != NULL);
 
-    snprintf (file, sizeof(file), "%03d_fb_%d.bmp", pSec->flip_cnt, bo_data->fb_id);
-    secUtilDoDumpBmps (pSec->dump_info, bo, w, h, NULL, file);
+    snprintf (file, sizeof(file), "%03d_fb_%"PRIdPTR".bmp", pSec->flip_cnt, bo_data->fb_id);
+    secUtilDoDumpBmps (pSec->dump_info, bo, w, h, NULL, file, DUMP_TYPE_BMP);
     pSec->flip_cnt++;
 }
 
@@ -251,18 +260,20 @@ SECCrtcConfigResize(ScrnInfoPtr pScrn, int width, int height)
                pScrn->virtualX,
                pScrn->virtualY,
                width, height);
-
+#ifdef NO_CRTC_MODE
+    pSec->isCrtcOn = secCrtcCheckInUseAll(pScrn);
+#endif
     if (pScrn->virtualX == width &&
         pScrn->virtualY == height)
     {
         return TRUE;
     }
-
     secFbResize(pSec->pFb, width, height);
 
     /* set  the new size of pScrn */
     pScrn->virtualX = width;
     pScrn->virtualY = height;
+    pScrn->displayWidth = width;
     secExaScreenSetScrnPixmap (pScreen);
 
     secOutputDrmUpdate (pScrn);
@@ -297,6 +308,12 @@ SECModeVblankHandler(int fd, unsigned int frame, unsigned int tv_sec,
     }
     else if (vblank_type == VBLANK_INFO_PLANE)
         secLayerVBlankEventHandler (frame, tv_sec, tv_usec, data);
+    else if (vblank_type == VBLANK_INFO_PRESENT)
+    {
+        XDBG_TRACE (MDISP, "vblank handler (%p, %ld, %ld)\n",
+                    pVblankInfo, pVblankInfo->time, GetTimeInMillis () - pVblankInfo->time);
+    	secPresentVblankHandler(frame, tv_sec, tv_usec, data);
+    }
     else
         XDBG_ERROR (MDISP, "unknown the vblank type\n");
 
@@ -377,25 +394,6 @@ SECModePageFlipHandler(int fd, unsigned int frame, unsigned int tv_sec,
         flip->back_bo = NULL;
     }
 
-    if (pCrtcPriv->flip_info == NULL)
-    {
-        /**
-        *  If pCrtcPriv->flip_info is failed and secCrtcGetFirstPendingFlip (pCrtc) has data,
-        *  ModePageFlipHandler is triggered by secDisplayUpdateRequest(). - Maybe FB_BLIT or FB is updated by CPU.
-        *  In this case we should call _secDri2ProcessPending().
-        */
-        DRI2FrameEventPtr pending_flip;
-        pending_flip = secCrtcGetFirstPendingFlip (pCrtc);
-        if( pending_flip != NULL )
-        {
-            XDBG_DEBUG (MDISP, "FB_BLIT or FB is updated by CPU. But there's secCrtcGetFirstPendingFlip(). So trigger it manually\n");
-            flip->dispatch_me = TRUE;
-            pCrtcPriv->flip_info = pending_flip;
-        }
-        else
-            goto fail;
-    }
-
     XDBG_DEBUG(MDISP, "ModePageFlipHandler ctrc_id:%d dispatch_me:%d, frame:%d, flip_count=%d is_pending=%p\n",
                secCrtcID(pCrtcPriv), flip->dispatch_me, frame, pCrtcPriv->flip_count, secCrtcGetFirstPendingFlip (pCrtc));
 
@@ -405,23 +403,27 @@ SECModePageFlipHandler(int fd, unsigned int frame, unsigned int tv_sec,
         secCrtcCountFps(pCrtc);
 
         /* Deliver cached msc, ust from reference crtc to flip event handler */
-        secDri2FlipEventHandler (pCrtcPriv->fe_frame, pCrtcPriv->fe_tv_sec,
-                                 pCrtcPriv->fe_tv_usec, pCrtcPriv->flip_info, flip->flip_failed);
+        if (flip->handler)
+        {
+            if (pCrtcPriv->flip_info != flip->data)
+            {
+                XDBG_NEVER_GET_HERE(MDISP);
+                pCrtcPriv->flip_info = flip->data;
+            }
+        	flip->handler(pCrtcPriv->fe_frame, pCrtcPriv->fe_tv_sec,
+                      	  pCrtcPriv->fe_tv_usec, pCrtcPriv->flip_info, flip->flip_failed);
+        }
     }
 
-    free (flip);
-    return;
-fail:
-    if (flip->accessibility_back_bo)
+    if (pCrtcPriv->flip_info == NULL)
     {
-        secRenderBoUnref(flip->accessibility_back_bo);
-        flip->accessibility_back_bo = NULL;
-    }
-
-    if (flip->back_bo)
-    {
-        secRenderBoUnref(flip->back_bo);
-        flip->back_bo = NULL;
+        /**
+         *  If pCrtcPriv->flip_info is failed and secCrtcGetFirstPendingFlip (pCrtc) has data,
+         *  ModePageFlipHandler is triggered by secDisplayUpdateRequest(). - Maybe FB_BLIT or FB is updated by CPU.
+         *  In this case we should call secDri2ProcessPending().
+         */
+        XDBG_DEBUG( MDISP, "FB_BLIT or FB is updated by CPU. But there's secCrtcGetFirstPendingFlip(). So called it manually\n");
+        secDri2ProcessPending (pCrtc, frame, tv_sec, tv_usec);
     }
 
     free (flip);
@@ -506,18 +508,23 @@ secModePreInit (ScrnInfoPtr pScrn, int drm_fd)
 
     xf86CrtcSetSizeRange (pScrn, 320, 200, pSecMode->mode_res->max_width,
                           pSecMode->mode_res->max_height);
-
+#if 1
     for (i = 0; i < pSecMode->mode_res->count_crtcs; i++)
         secCrtcInit (pScrn, pSecMode, i);
 
     for (i = 0; i < pSecMode->mode_res->count_connectors; i++)
         secOutputInit (pScrn, pSecMode, i);
-
+#endif
     for (i = 0; i < pSecMode->plane_res->count_planes; i++)
         secPlaneInit (pScrn, pSecMode, i);
-
+#if 0
+    secDummyOutputInit(pScrn, pSecMode, FALSE);
+#endif //NO_CRTC_MODE
     _secSetMainMode (pScrn, pSecMode);
 
+    /* virtaul x and virtual y of the screen is ones from main lcd mode */
+    pScrn->virtualX = pSecMode->main_lcd_mode.hdisplay;
+    pScrn->virtualY = pSecMode->main_lcd_mode.vdisplay;
     xf86InitialConfiguration (pScrn, TRUE);
 
     /* soolim::
@@ -532,11 +539,11 @@ secModePreInit (ScrnInfoPtr pScrn, int drm_fd)
     /* virtaul x and virtual y of the screen is ones from main lcd mode */
     pScrn->virtualX = pSecMode->main_lcd_mode.hdisplay;
     pScrn->virtualY = pSecMode->main_lcd_mode.vdisplay;
-
+#ifdef USE_XDBG
 #if DBG_DRM_EVENT
     xDbgLogDrmEventInit();
 #endif
-
+#endif
     return TRUE;
 }
 
@@ -594,6 +601,25 @@ secModeDeinit (ScrnInfoPtr pScrn)
         drmModeFreePlaneResources (pSecMode->plane_res);
 
     /* mode->rotate_fb_id should have been destroyed already */
+
+#ifdef NO_CRTC_MODE
+    if (pSecMode->num_dummy_output > 0)
+    {
+        xf86CrtcConfigPtr xf86_config = XF86_CRTC_CONFIG_PTR(pScrn);
+        int i;
+        for (i = 0; i < xf86_config->num_crtc; i++)
+        {
+            xf86CrtcPtr pCrtc = xf86_config->crtc[i];
+            xf86CrtcDestroy (pCrtc);
+        }
+
+        for (i = 0; i < xf86_config->num_output; i++)
+        {
+            xf86OutputPtr pOutput = xf86_config->output[i];
+            xf86OutputDestroy(pOutput);
+        }
+    }
+#endif //NO_CRTC_MODE
 
     free (pSecMode);
     pSec->pSecMode = NULL;
@@ -664,11 +690,15 @@ secModeCoveringCrtc (ScrnInfoPtr pScrn, BoxPtr pBox, xf86CrtcPtr pDesiredCrtc, B
 int secModeGetCrtcPipe (xf86CrtcPtr pCrtc)
 {
     SECCrtcPrivPtr pCrtcPriv = pCrtc->driver_private;
+    if (pCrtcPriv == NULL)
+        return -1;
     return pCrtcPriv->pipe;
 }
 
 Bool
-secModePageFlip (ScrnInfoPtr pScrn, xf86CrtcPtr pCrtc, void* flip_info, int pipe, tbm_bo back_bo)
+secModePageFlip (ScrnInfoPtr pScrn, xf86CrtcPtr pCrtc, void* flip_info, int pipe, tbm_bo back_bo,
+				 RegionPtr pFlipRegion, unsigned int client_idx, XID drawable_id,
+				 SECFlipEventHandler handler, Bool change_front)
 {
     SECPageFlipPtr pPageFlip = NULL;
     SECFbBoDataPtr bo_data;
@@ -679,7 +709,6 @@ secModePageFlip (ScrnInfoPtr pScrn, xf86CrtcPtr pCrtc, void* flip_info, int pipe
     SECPtr pSec = SECPTR(pScrn);
     int ret;
     int fb_id = 0;
-    DRI2FrameEventPtr pEvent = (DRI2FrameEventPtr) flip_info;
 
     BoxRec b1;
     int retBox, found=0;
@@ -720,6 +749,7 @@ secModePageFlip (ScrnInfoPtr pScrn, xf86CrtcPtr pCrtc, void* flip_info, int pipe
             pPageFlip->back_bo = secRenderBoRef (back_bo);
             pPageFlip->data = flip_info;
             pPageFlip->flip_failed = FALSE;
+            pPageFlip->handler = handler;
 
             /* accessilitity */
             if (pCrtcPriv->bAccessibility || pCrtcPriv->screen_rotate_degree > 0)
@@ -752,7 +782,7 @@ secModePageFlip (ScrnInfoPtr pScrn, xf86CrtcPtr pCrtc, void* flip_info, int pipe
                 secCrtcTurn (pCrtcPriv->pCrtc, TRUE, FALSE, FALSE);
 
 #if DBG_DRM_EVENT
-            pPageFlip->xdbg_log_pageflip = xDbgLogDrmEventAddPageflip (pipe, pEvent->client_idx, pEvent->drawable_id);
+            pPageFlip->xdbg_log_pageflip = xDbgLogDrmEventAddPageflip (pipe, client_idx, drawable_id);
 #endif
 
             XDBG_DEBUG (MSEC, "dump_mode(%x)\n", pSec->dump_mode);
@@ -765,12 +795,12 @@ secModePageFlip (ScrnInfoPtr pScrn, xf86CrtcPtr pCrtc, void* flip_info, int pipe
             pPageFlip->time = GetTimeInMillis ();
 
             /*Set DirtyFB*/
-            if(pSec->use_partial_update && pEvent->pRegion)
+            if(pSec->use_partial_update && pFlipRegion)
             {
                 int nBox;
                 BoxPtr pBox;
                 RegionRec new_region;
-                RegionPtr pRegion = pEvent->pRegion;
+                RegionPtr pRegion = pFlipRegion;
 
                 for (nBox = RegionNumRects(pRegion),
                      pBox = RegionRects(pRegion); nBox--; pBox++)
@@ -781,7 +811,7 @@ secModePageFlip (ScrnInfoPtr pScrn, xf86CrtcPtr pCrtc, void* flip_info, int pipe
 
                 if (pCrtcPriv->screen_rotate_degree > 0)
                 {
-                    RegionCopy (&new_region, pEvent->pRegion);
+                    RegionCopy (&new_region, pFlipRegion);
                     secUtilRotateRegion (pCrtc->mode.HDisplay, pCrtc->mode.VDisplay,
                                          &new_region, pCrtcPriv->screen_rotate_degree);
                     pRegion = &new_region;
@@ -799,7 +829,6 @@ secModePageFlip (ScrnInfoPtr pScrn, xf86CrtcPtr pCrtc, void* flip_info, int pipe
                                 (uint32_t)RegionNumRects (pRegion));
             }
 
-
             /* DRM Page Flip */
             ret  = drmModePageFlip (pSec->drm_fd, secCrtcID(pCrtcPriv), fb_id,
                     DRM_MODE_PAGE_FLIP_EVENT, pPageFlip);
@@ -813,6 +842,8 @@ secModePageFlip (ScrnInfoPtr pScrn, xf86CrtcPtr pCrtc, void* flip_info, int pipe
 
             pCrtcPriv->flip_count++; /* check flipping completed */
             pCrtcPriv->flip_info = (DRI2FrameEventPtr)flip_info;
+            if (change_front)
+                pCrtcPriv->front_bo = back_bo;
 
             found++;
             XDBG_DEBUG(MDISP, "ModePageFlip crtc_id:%d, fb_id:%d, back_fb_id:%d, back_name:%d, accessibility:%d\n",
@@ -1220,7 +1251,6 @@ secDisplaySetDispSetMode  (ScrnInfoPtr pScrn, SECDisplaySetMode set_mode)
 {
     SECPtr pSec = SECPTR (pScrn);
     SECModePtr pSecMode = pSec->pSecMode;
-
     if (pSecMode->set_mode == set_mode)
     {
         XDBG_INFO (MDISP, "set_mode(%d) is already set\n", set_mode);
@@ -1267,7 +1297,7 @@ secDisplaySetDispSetMode  (ScrnInfoPtr pScrn, SECDisplaySetMode set_mode)
 
             XDBG_TRACE (MWB, "wb_hz(%d) vrefresh(%d)\n", pSec->wb_hz, pSecMode->ext_connector_mode.vrefresh);
 
-            pSec->wb_clone = secWbOpen (pScrn, FOURCC_SN12, 0, 0, (pSec->scanout)?TRUE:FALSE, wb_hz, TRUE);
+            pSec->wb_clone = secWbOpen (pScrn, FOURCC_ST12, 0, 0, (pSec->scanout)?TRUE:FALSE, wb_hz, TRUE);
             if (pSec->wb_clone)
             {
                 secWbAddNotifyFunc (pSec->wb_clone, WB_NOTI_CLOSED,
@@ -1383,14 +1413,21 @@ secDisplayGetDispConnMode (ScrnInfoPtr pScrn)
 }
 
 Bool
-secDisplayGetCurMSC (ScrnInfoPtr pScrn, int pipe, CARD64 *ust, CARD64 *msc)
+secDisplayGetCurMSC (ScrnInfoPtr pScrn, intptr_t pipe, CARD64 *ust, CARD64 *msc)
 {
     drmVBlank vbl;
     int ret;
     SECPtr pSec = SECPTR (pScrn);
-    SECModePtr pSecMode = pSec->pSecMode;
 
     /* if lcd is off, return true with msc = 0 */
+#ifdef NO_CRTC_MODE
+    if (pSec->isCrtcOn == FALSE)
+    {
+        *ust = 0;
+        *msc = 0;
+        return TRUE;
+    }
+#endif //NO_CRTC_MODE
     if (pSec->isLcdOff)
     {
         *ust = 0;
@@ -1407,9 +1444,12 @@ secDisplayGetCurMSC (ScrnInfoPtr pScrn, int pipe, CARD64 *ust, CARD64 *msc)
 
     if (pipe > 0)
     {
+#ifdef LEGACY_INTERFACE
+        SECModePtr pSecMode = pSec->pSecMode;
         if (pSecMode->conn_mode == DISPLAY_CONN_MODE_VIRTUAL)
             vbl.request.type |= _DRM_VBLANK_EXYNOS_VIDI;
         else
+#endif
             vbl.request.type |= DRM_VBLANK_SECONDARY;
     }
 
@@ -1432,7 +1472,7 @@ secDisplayGetCurMSC (ScrnInfoPtr pScrn, int pipe, CARD64 *ust, CARD64 *msc)
 }
 
 Bool
-secDisplayVBlank (ScrnInfoPtr pScrn, int pipe, CARD64 *target_msc, int flip,
+secDisplayVBlank (ScrnInfoPtr pScrn, intptr_t pipe, CARD64 *target_msc, intptr_t flip,
                         SECVBlankInfoType type, void *vblank_info)
 {
     drmVBlank vbl;
@@ -1456,9 +1496,11 @@ secDisplayVBlank (ScrnInfoPtr pScrn, int pipe, CARD64 *target_msc, int flip,
 
     if (pipe > 0)
     {
+#ifdef LEGACY_INTERFACE
         if (pSecMode->conn_mode == DISPLAY_CONN_MODE_VIRTUAL)
             vbl.request.type |= _DRM_VBLANK_EXYNOS_VIDI;
         else
+#endif
             vbl.request.type |= DRM_VBLANK_SECONDARY;
     }
 
@@ -1531,7 +1573,7 @@ secDisplayDrawablePipe (DrawablePtr pDraw)
     return pipe;
 }
 
-int
+intptr_t
 secDisplayCrtcPipe (ScrnInfoPtr pScrn, int crtc_id)
 {
     xf86CrtcConfigPtr pCrtcConfig = XF86_CRTC_CONFIG_PTR (pScrn);
@@ -1569,14 +1611,27 @@ Bool secDisplayUpdateRequest(ScrnInfoPtr pScrn)
     Bool ret = FALSE;
     SECPageFlipPtr pPageFlip = NULL;
 
+#ifdef NO_CRTC_MODE
+    if (pCrtc == NULL)
+        return FALSE;
+#else
     XDBG_RETURN_VAL_IF_FAIL (pCrtc != NULL, FALSE);
-
+#endif
     pCrtcPriv =  pCrtc->driver_private;
+#ifdef NO_CRTC_MODE
+    if (pCrtcPriv == NULL)
+        return TRUE;
+#else
     XDBG_RETURN_VAL_IF_FAIL (pCrtcPriv != NULL, FALSE);
+#endif
 
     bo = pCrtcPriv->front_bo;
 
-    if( pCrtcPriv->is_fb_blit_flipping || pCrtcPriv->is_flipping || secCrtcGetFirstPendingFlip (pCrtc) )
+    if( pSec->use_hwc || !pSec->use_flip || pSec->use_setplane)
+    {
+        XDBG_DEBUG (MDISP, "hwc enable\n");
+    }
+    else if( pCrtcPriv->is_fb_blit_flipping || pCrtcPriv->is_flipping || secCrtcGetFirstPendingFlip (pCrtc) )
     {
         XDBG_DEBUG (MDISP, "drmModePageFlip is already requested!\n");
     }
@@ -1611,6 +1666,8 @@ Bool secDisplayUpdateRequest(ScrnInfoPtr pScrn)
             pPageFlip->flip_failed = FALSE;
             pPageFlip->xdbg_log_pageflip = NULL;
             pPageFlip->time = GetTimeInMillis ();
+            /*TODO: add own handler */
+            pPageFlip->handler = NULL;
 
             /* accessilitity */
             if (pCrtcPriv->bAccessibility || pCrtcPriv->screen_rotate_degree > 0)
@@ -1679,3 +1736,105 @@ fail :
     return ret;
 }
 
+#ifdef NO_CRTC_MODE
+Bool
+secDisplayChangeMode (ScrnInfoPtr pScrn)
+{
+    SECPtr pSec = SECPTR(pScrn);
+    SECModePtr pSecMode = pSec->pSecMode;
+    xf86CrtcPtr pCrtc = NULL;
+    xf86OutputPtr pOutput = NULL;
+    int temp = 99, i = 0;
+    xf86CrtcConfigPtr config = XF86_CRTC_CONFIG_PTR(pScrn);
+    for (i = 0; i < config->num_crtc; i++)
+    {
+        if (config->crtc[i]->active == TRUE)
+        {
+            /* Nothing to do */
+            return TRUE;
+        }
+    }
+    SECOutputPrivPtr output_ref = NULL, output_next = NULL;
+/* Priority LVDS > HDMI > Virtual */
+    xorg_list_for_each_entry_safe (output_ref, output_next, &pSecMode->outputs, link)
+    {
+        if (output_ref->pOutput->crtc == NULL)
+            continue;
+        if (output_ref->mode_output == NULL)
+            continue;
+        if (output_ref->mode_output->connector_type == DRM_MODE_CONNECTOR_Unknown)
+            continue;
+        if (output_ref->mode_output->connector_type < temp)
+        {
+            pOutput = output_ref->pOutput;
+            pCrtc = output_ref->pOutput->crtc;
+            temp = (int) output_ref->mode_output->connector_type;
+        }
+    }
+
+    if (pCrtc != NULL && pOutput != NULL && pCrtc->active == FALSE)
+    {
+        DisplayModePtr max_mode = xf86CVTMode( 4096, 4096, 60, 0, 0);
+        DisplayModePtr mode =
+                xf86OutputFindClosestMode(pOutput, max_mode);
+        if (mode == NULL)
+        {
+            XDBG_ERROR(MDISP,
+                       "Can't find display mode for output: %s\n", pOutput->name);
+            if (max_mode)
+                free(max_mode);
+            return FALSE;
+        }
+        if (!RRScreenSizeSet(pScrn->pScreen,
+                             mode->HDisplay, mode->VDisplay,
+                             pOutput->mm_width, pOutput->mm_height))
+        {
+            XDBG_ERROR(MDISP,
+                       "Can't setup screen size H:%d V:%d for output: %s\n",
+                       mode->HDisplay, mode->VDisplay, pOutput->name);
+            if (max_mode)
+                free(max_mode);
+            return FALSE;
+        }
+        if (!xf86CrtcSetModeTransform(pCrtc, mode, RR_Rotate_0, NULL, 0, 0))
+        {
+            XDBG_ERROR(MDISP,
+                       "Can't transform Crtc to mode: %s\n", mode->name);
+            if (max_mode)
+                free(max_mode);
+            RRScreenSizeSet(pScrn->pScreen, 640, 480, 0, 0);
+            return FALSE;
+        }
+        if (max_mode)
+            free(max_mode);
+        pSec->enableCursor = TRUE;
+        secCrtcCursorEnable (pScrn, TRUE);
+//        xf86CrtcConfigPtr config = XF86_CRTC_CONFIG_PTR(pScrn);
+//        for (temp = 0; temp < config->num_output; temp++)
+//        {
+//            if (config->output[temp] == pOutput)
+//            {
+//                config->compat_output = temp;
+//                break;
+//            }
+//        }
+        xf86SetScrnInfoModes(pScrn);
+        xf86RandR12TellChanged(pScrn->pScreen);
+    }
+
+    if (pSec->isCrtcOn == FALSE)
+    {
+        pSec->enableCursor = FALSE;
+        secCrtcCursorEnable (pScrn, FALSE);
+    }
+
+    if (pCrtc == NULL)
+    {
+        RRScreenSizeSet(pScrn->pScreen, 640, 480, 0, 0);
+        xf86SetScrnInfoModes(pScrn);
+        xf86RandR12TellChanged(pScrn->pScreen);
+    }
+
+    return TRUE;
+}
+#endif

@@ -34,7 +34,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <fourcc.h>
 #include <drm_fourcc.h>
 
-#define C(b,m)              (((b) >> (m)) & 0xFF)
+#define C(b,m)              (char)(((b) >> (m)) & 0xFF)
 #define B(c,s)              ((((unsigned int)(c)) & 0xff) << (s))
 #define FOURCC(a,b,c,d)     (B(d,24) | B(c,16) | B(b,8) | B(a,0))
 #define FOURCC_STR(id)      C(id,0), C(id,8), C(id,16), C(id,24)
@@ -42,6 +42,10 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define IS_ZEROCOPY(id)     ((C(id,0) == 'S') || id == FOURCC_ITLV)
 #define IS_RGB(id)           (id == FOURCC_RGB565 || id == FOURCC_RGB32 || \
                               id == FOURCC_SR16 || id == FOURCC_SR32)
+#define IS_YUV(id)           (id == FOURCC_Y444 || id == FOURCC_S420    || \
+                              id == FOURCC_SUYV || id == FOURCC_SYVY)
+
+
 
 /* Specific format for S.LSI
  * 2x2 subsampled Cr:Cb plane 64x32 macroblocks

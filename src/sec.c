@@ -31,6 +31,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
+#include <xorg-server.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
@@ -40,7 +41,6 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include "fb.h"
 #include "mipointer.h"
-#include "mibstore.h"
 #include "micmap.h"
 #include "colormapst.h"
 #include "xf86cmap.h"
@@ -53,10 +53,14 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "sec_xberc.h"
 #include "sec_util.h"
 #include "sec_wb.h"
+#include "sec_crtc.h"
 #include <tbm_bufmgr.h>
 #include "fimg2d.h"
+#include "sec_output.h"
+#include "sec_layer_manager.h"
 
 #define OPTION_FLIP_BUFFERS 0
+#define EXYNOS_DRM_NAME "exynos"
 
 /* prototypes */
 static const OptionInfoRec* SECAvailableOptions (int chipid, int busid);
@@ -110,7 +114,13 @@ typedef enum
     OPTION_CACHABLE,
     OPTION_SCANOUT,
     OPTION_ACCEL2D,
+    OPTION_PRESENT,
+    OPTION_DRI3,
     OPTION_PARTIAL_UPDATE,
+    OPTION_HWC,
+    OPTION_HWA,
+    OPTION_SET_PLANE,
+    OPTION_PAGE_FLIP
 } SECOpts;
 
 static const OptionInfoRec SECOptions[] =
@@ -127,7 +137,13 @@ static const OptionInfoRec SECOptions[] =
     { OPTION_CACHABLE, "cachable",   OPTV_BOOLEAN, {0}, FALSE },
     { OPTION_SCANOUT,  "scanout",    OPTV_BOOLEAN, {0}, FALSE },
     { OPTION_ACCEL2D,  "accel_2d",   OPTV_BOOLEAN, {0}, FALSE },
+    { OPTION_PRESENT,  "present",    OPTV_BOOLEAN, {0}, FALSE },
+    { OPTION_DRI3,     "dri3",       OPTV_BOOLEAN, {0}, FALSE },
     { OPTION_PARTIAL_UPDATE,  "partial_update",    OPTV_BOOLEAN, {0}, FALSE },
+    { OPTION_HWC,      "hwc",        OPTV_BOOLEAN, {0}, FALSE },
+    { OPTION_HWA,      "hwa",        OPTV_BOOLEAN, {0}, FALSE },
+    { OPTION_SET_PLANE,"set_plane",  OPTV_BOOLEAN, {0}, FALSE },
+    { OPTION_PAGE_FLIP,"flip",       OPTV_BOOLEAN, {0}, FALSE },
     { -1,              NULL,         OPTV_NONE,    {0}, FALSE }
 };
 
@@ -175,12 +191,87 @@ SECSetup (pointer module, pointer opts, int *errmaj, int *errmin)
 #endif /* XFree86LOADER */
 /* -------------------------------------------------------------------- */
 
-/* TODO:::check the fimd_drm */
-static Bool
-_has_drm_mode_setting()
+static int
+_secOpenDRM(void)
 {
-    /* TODO:: check the sysfs dri2 device name */
-    return TRUE;
+    int fd = -1;
+    fd = drmOpen (EXYNOS_DRM_NAME, NULL);
+#ifdef HAVE_UDEV
+    if (fd < 0)
+    {
+        struct udev *udev;
+        struct udev_enumerate *e;
+        struct udev_list_entry *entry;
+        struct udev_device *device, *drm_device, *device_parent;
+        const char *filename;
+
+        xf86Msg (X_WARNING, "[DRM] Cannot open drm device.. search by udev\n");
+        udev = udev_new();
+        if (!udev)
+        {
+            xf86Msg (X_ERROR,"[DRM] fail to initialize udev context\n");
+            goto close_l;
+        }
+        /* Will try to find sys path /exynos-drm/drm/card0 */
+        e = udev_enumerate_new(udev);
+        udev_enumerate_add_match_subsystem(e, "drm");
+        udev_enumerate_add_match_sysname(e, "card[0-9]*");
+        udev_enumerate_scan_devices(e);
+
+        drm_device = NULL;
+        udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(e))
+        {
+            device = udev_device_new_from_syspath(udev_enumerate_get_udev(e),
+                                                  udev_list_entry_get_name(entry));
+            device_parent = udev_device_get_parent(device);
+            /* Not need unref device_parent. device_parent and device have same refcnt */
+            if (device_parent)
+            {
+                if(strcmp(udev_device_get_sysname(device_parent), "exynos-drm") == 0)
+                {
+                    drm_device = device;
+                    xf86Msg (X_INFO,"Found drm device: '%s' (%s)\n",
+                             udev_device_get_syspath(drm_device),
+                             udev_device_get_sysname(device_parent));
+                    break;
+                }
+            }
+            udev_device_unref(device);
+        }
+
+        if(drm_device == NULL)
+        {
+            xf86Msg (X_ERROR, "[DRM] fail to find drm device\n");
+            udev_enumerate_unref(e);
+            udev_unref(udev);
+            goto close_l;
+        }
+
+        filename = udev_device_get_devnode(drm_device);
+
+        fd  = open(filename, O_RDWR|O_CLOEXEC);
+        if (fd < 0)
+        {
+            xf86Msg (X_ERROR, "[DRM] Cannot open drm device(%s)\n", filename);
+        }
+        udev_device_unref(drm_device);
+        udev_enumerate_unref(e);
+        udev_unref(udev);
+    }
+#endif
+close_l:
+    return fd;
+}
+
+static void
+_secCloseDRM(int fd)
+{
+    if (fd < 0)
+        return;
+    if (drmClose(fd) < 0)
+    {
+        xf86Msg (X_ERROR, "[DRM] Cannot close drm device fd=%d\n", fd);
+    }
 }
 
 /*
@@ -190,9 +281,14 @@ _has_drm_mode_setting()
 static Bool
 _secHwProbe (struct pci_device * pPci, char *device,char **namep)
 {
-    if (!_has_drm_mode_setting())
+    int fd = -1;
+    fd = _secOpenDRM();
+    if (fd < 0)
+    {
         return FALSE;
+    }
 
+    _secCloseDRM(fd);
     return TRUE;
 }
 
@@ -212,6 +308,7 @@ _secInitBufmgr (int drm_fd, void * arg)
     return bufmgr;
 }
 
+
 static void
 _secDeInitBufmgr (tbm_bufmgr bufmgr)
 {
@@ -227,81 +324,11 @@ _openDrmMaster (ScrnInfoPtr pScrn)
     int ret;
 
     /* open drm */
-    pSec->drm_fd = drmOpen ("exynos", NULL);
+    pSec->drm_fd = _secOpenDRM();
     if (pSec->drm_fd < 0)
     {
-        struct udev *udev;
-        struct udev_enumerate *e;
-        struct udev_list_entry *entry;
-        struct udev_device *device, *drm_device;
-        const char *path, *device_seat;
-        const char *filename;
-
-        xf86DrvMsg (pScrn->scrnIndex, X_WARNING, "[DRM] Cannot open drm device.. search by udev\n");
-
-        /* STEP 1: Find drm device */
-        udev = udev_new();
-        if (udev == NULL)
-        {
-            xf86DrvMsg (pScrn->scrnIndex, X_ERROR,"[DRM] fail to initialize udev context\n");
-            goto fail_to_open_drm_master;
-        }
-
-        e = udev_enumerate_new(udev);
-        udev_enumerate_add_match_subsystem(e, "drm");
-        udev_enumerate_add_match_sysname(e, "card[0-9]*");
-        udev_enumerate_scan_devices(e);
-
-        drm_device = NULL;
-        udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(e))
-        {
-            path = udev_list_entry_get_name(entry);
-            device = udev_device_new_from_syspath(udev, path);
-            device_seat = udev_device_get_property_value(device, "ID_SEAT");
-            xf86DrvMsg (pScrn->scrnIndex, X_CONFIG, "[DRM] drm info: device:%p, patch:%s, seat:%s\n", device, path, device_seat);
-
-            if(!device_seat)
-                device_seat = "seat0";
-
-            if(strcmp(device_seat, "seat0") == 0)
-            {
-                drm_device = device;
-                break;
-            }
-            udev_device_unref(device);
-        }
-
-        if(drm_device == NULL)
-        {
-            xf86DrvMsg (pScrn->scrnIndex, X_ERROR,"[DRM] fail to find drm device\n");
-            goto fail_to_open_drm_master;
-        }
-
-        filename = udev_device_get_devnode(drm_device);
-
-        pSec->drm_fd  = open(filename, O_RDWR|O_CLOEXEC);
-        if (pSec->drm_fd < 0)
-        {
-            xf86DrvMsg (pScrn->scrnIndex, X_ERROR, "[DRM] Cannot open drm device(%s)\n", filename);
-
-            udev_device_unref(drm_device);
-            udev_enumerate_unref(e);
-            udev_unref(udev);
-
-            goto fail_to_open_drm_master;
-        }
-        else
-        {
-            xf86DrvMsg (pScrn->scrnIndex, X_CONFIG, "[DRM] Succeed to open drm device(%s)\n", filename);
-        }
-
-        udev_device_unref(drm_device);
-        udev_enumerate_unref(e);
-        udev_unref(udev);
-    }
-    else
-    {
-        xf86DrvMsg (pScrn->scrnIndex, X_CONFIG, "[DRM] Succeed to open drm device\n");
+        xf86DrvMsg (pScrn->scrnIndex, X_ERROR, "[DRM] Cannot open drm device\n");
+        goto fail_to_open_drm_master;
     }
 
     pSec->drm_device_name = drmGetDeviceNameFromFd (pSec->drm_fd);
@@ -350,7 +377,7 @@ fail_to_open_drm_master:
 
     if (pSec->drm_fd >= 0)
     {
-        drmClose (pSec->drm_fd);
+        _secCloseDRM(pSec->drm_fd);
         pSec->drm_fd = -1;
     }
 
@@ -369,16 +396,16 @@ _closeDrmMaster (ScrnInfoPtr pScrn)
         pSec->tbm_bufmgr = NULL;
     }
 
-    if (pSec->drm_fd >= 0)
-    {
-        drmClose (pSec->drm_fd);
-        pSec->drm_fd = -1;
-    }
-
     if (pSec->drm_device_name)
     {
         free (pSec->drm_device_name);
         pSec->drm_device_name = NULL;
+    }
+
+    if (pSec->drm_fd >= 0)
+    {
+        _secCloseDRM(pSec->drm_fd);
+        pSec->drm_fd = -1;
     }
 }
 
@@ -410,7 +437,10 @@ _secHwInit (ScrnInfoPtr pScrn, struct pci_device *pPci, char *device)
     else
         xf86DrvMsg (pScrn->scrnIndex, X_CONFIG
                     , "G2D is disabled\n");
-
+#ifdef NO_CRTC_MODE
+   /*** Temporary disable G2D acceleration for using PIXMAN ***/
+    pSec->is_accel_2d = FALSE;
+#endif
     return TRUE;
 }
 
@@ -472,7 +502,7 @@ _checkDriverOptions (ScrnInfoPtr pScrn)
     int flip_bufs = 3;
 
     /* exa */
-    if (xf86ReturnOptValBool (pSec->Options, OPTION_EXA, FALSE))
+    if (xf86ReturnOptValBool (pSec->Options, OPTION_EXA, TRUE))
         pSec->is_exa = TRUE;
 
     /* sw exa */
@@ -499,6 +529,20 @@ _checkDriverOptions (ScrnInfoPtr pScrn)
             pSec->flip_bufs = flip_bufs;
         }
     }
+
+#ifdef HAVE_DRI3_PRESENT_H
+    /* present */
+    if (xf86ReturnOptValBool (pSec->Options, OPTION_PRESENT, FALSE))
+    {
+        pSec->is_present = TRUE;
+    }
+
+    /* dri3 */
+    if (xf86ReturnOptValBool (pSec->Options, OPTION_DRI3, FALSE))
+    {
+        pSec->is_dri3 = TRUE;
+    }
+#endif
 
     /* rotate */
     pSec->rotate = RR_Rotate_0;
@@ -571,6 +615,53 @@ _checkDriverOptions (ScrnInfoPtr pScrn)
             xf86DrvMsg (pScrn->scrnIndex, X_CONFIG, "Use partial update.\n");
         }
     }
+
+    /* page_flip */
+    pSec->use_flip = TRUE;
+    if (!xf86ReturnOptValBool (pSec->Options, OPTION_PAGE_FLIP, TRUE))
+    {
+        pSec->use_flip = FALSE;
+        xf86DrvMsg (pScrn->scrnIndex, X_WARNING, "Page flip DISABLE\n");
+    }
+
+
+    /* HWC default*/
+    pSec->use_hwc = FALSE;
+    /* default value without HWC */
+    pSec->use_setplane = FALSE;
+#ifdef HAVE_HWC_H
+    if (xf86ReturnOptValBool (pSec->Options, OPTION_HWC, FALSE))
+    {
+        pSec->use_hwc = TRUE;
+        xf86DrvMsg (pScrn->scrnIndex, X_CONFIG, "Use HWC extension.\n");
+        /* default value with HWC */
+        pSec->use_setplane = TRUE;
+    }
+#endif
+
+#ifdef HAVE_HWA_H
+    if (xf86ReturnOptValBool (pSec->Options, OPTION_HWA, FALSE))
+    {
+        pSec->use_hwa = TRUE;
+        xf86DrvMsg (pScrn->scrnIndex, X_CONFIG, "Use HWA extension.\n");
+    }
+#endif
+
+
+    /* set_plane */
+    if (xf86ReturnOptValBool (pSec->Options, OPTION_SET_PLANE, FALSE))
+    {
+        pSec->use_setplane = TRUE;
+    }
+
+    if (pSec->use_flip)
+    {
+        if (pSec->use_setplane)
+            xf86DrvMsg (pScrn->scrnIndex, X_CONFIG, "Page flip using plane\n");
+        else
+            xf86DrvMsg (pScrn->scrnIndex, X_CONFIG, "Page flip using crtc (drmModePegeFlip())\n");
+    }
+
 }
 
 #if HAVE_UDEV
@@ -669,7 +760,11 @@ SECUdevEventsHandler (int fd, void *closure)
             hotplug && atoi(hotplug) == 1)
     {
         XDBG_INFO(MSEC, "SEC-UDEV: HotPlug\n");
-        RRGetInfo (screenInfo.screens[pScrn->scrnIndex], TRUE);
+        RRGetInfo (xf86ScrnToScreen(pScrn), TRUE);
+#ifdef NO_CRTC_MODE
+        secOutputDrmUpdate (pScrn);
+        secDisplayChangeMode(pScrn);
+#endif
     }
 
     udev_device_unref(dev);
@@ -698,7 +793,7 @@ SECProbe (DriverPtr pDrv, int flags)
 {
     int i;
     ScrnInfoPtr pScrn;
-    GDevPtr *ppDevSections;
+    GDevPtr *ppDevSections = NULL;
     int numDevSections;
     int entity;
     Bool foundScreen = FALSE;
@@ -709,19 +804,32 @@ SECProbe (DriverPtr pDrv, int flags)
         return FALSE;
     }
 
-    /* For now, just bail out for PROBE_DETECT. */
-    if (flags & PROBE_DETECT)
-        return FALSE;
+    numDevSections = xf86MatchDevice (SEC_DRIVER_NAME, &ppDevSections);
 
-    if ((numDevSections = xf86MatchDevice (SEC_DRIVER_NAME, &ppDevSections)) <= 0)
-        return FALSE;
+
+    if ((flags & PROBE_DETECT) && (numDevSections <= 0))
+    {
+        numDevSections = 1;
+    }
 
     for (i = 0; i < numDevSections; i++)
     {
-        entity = xf86ClaimNoSlot (pDrv, 0, ppDevSections[i], TRUE);
+
+        if (flags & PROBE_DETECT)
+        {
+            xf86AddBusDeviceToConfigure(SEC_DRIVER_NAME,
+                    BUS_NONE, NULL, i);
+            foundScreen = TRUE;
+            continue;
+        }
 
         pScrn = xf86AllocateScreen (pDrv, flags);
-        xf86AddEntityToScreen (pScrn, entity);
+
+        if (ppDevSections)
+        {
+            entity = xf86ClaimNoSlot (pDrv, 0, ppDevSections[i], TRUE);
+            xf86AddEntityToScreen (pScrn, entity);
+        }
 
         if (pScrn)
         {
@@ -743,7 +851,10 @@ SECProbe (DriverPtr pDrv, int flags)
                         "using drm mode setting device\n");
         }
     }
-    free (ppDevSections);
+    if (ppDevSections)
+    {
+        free (ppDevSections);
+    }
 
     return foundScreen;
 }
@@ -850,8 +961,17 @@ SECPreInit (ScrnInfoPtr pScrn, int flags)
                     "fail to set the gamma\n");
         goto bail1;
     }
-
+#ifdef NO_CRTC_MODE
+    if (pScrn->modes == NULL)
+    {
+        pScrn->modes = xf86ModesAdd(pScrn->modes,
+                                    xf86CVTMode(pScrn->virtualX,
+                                                pScrn->virtualY,
+                                                60, 0, 0));
+    }
+#endif
     pScrn->currentMode = pScrn->modes;
+
     pScrn->displayWidth = pScrn->virtualX;
     xf86PrintModes (pScrn); /* just print the current mode */
 
@@ -913,7 +1033,17 @@ SECScreenInit (ScreenPtr pScreen, int argc, char **argv)
                 (int) pScrn->offset.red,
                 (int) pScrn->offset.green,
                 (int) pScrn->offset.blue);
-
+#ifdef LAYER_MANAGER
+    /* Init Layer manager */
+    if (!secLayerMngInit(pScrn))
+    {
+        xf86DrvMsg (pScrn->scrnIndex, X_ERROR ,
+                    "Fail to initialize layer manager\n");
+        return FALSE;
+    }
+    xf86DrvMsg (pScrn->scrnIndex, X_INFO ,
+                "[LYRM] Initialized layer manager\n");
+#endif
     /* initialize the framebuffer */
     /* soolim :: think rotations */
 
@@ -1008,8 +1138,57 @@ SECScreenInit (ScreenPtr pScreen, int argc, char **argv)
                                 "DRI2 initialization failed\n");
                 }
             }
+
+#ifdef HAVE_DRI3_PRESENT_H
+            if (pSec->is_present)
+            {
+            	if(!secPresentScreenInit(pScreen))
+            	{
+                    xf86DrvMsg (pScrn->scrnIndex, X_WARNING,
+                                "Present initialization failed\n");
+                }
+            }
+
+            /* init the dri3 */
+            if (pSec->is_dri3)
+            {
+                if (!secDri3ScreenInit (pScreen))
+                {
+                    xf86DrvMsg (pScrn->scrnIndex, X_WARNING,
+                                "DRI3 initialization failed\n");
+                }
+            }
+#endif
         }
     }
+
+#ifdef HAVE_HWC_H
+    if (pSec->use_hwc)
+    {
+        if (!secHwcInit (pScreen))
+        {
+            xf86DrvMsg (pScrn->scrnIndex, X_WARNING, "HWC initialization failed\n");
+        }
+        else
+        {
+            xf86DrvMsg (pScrn->scrnIndex, X_WARNING, "HWC initialization succeed\n");
+        }
+    }
+#endif
+
+#ifdef HAVE_HWA_H
+    if (pSec->use_hwa)
+    {
+        if (!secHwaInit (pScreen))
+        {
+            xf86DrvMsg (pScrn->scrnIndex, X_WARNING, "HWA initialization failed\n");
+        }
+        else
+        {
+            xf86DrvMsg (pScrn->scrnIndex, X_WARNING, "HWA initialization succeed\n");
+        }
+    }
+#endif
 
     /* XVideo Initiailization here */
     if (!secVideoInit (pScreen))
@@ -1017,14 +1196,13 @@ SECScreenInit (ScreenPtr pScreen, int argc, char **argv)
                     "XVideo extention initialization failed\n");
 
     xf86SetBlackWhitePixels (pScreen);
-    miInitializeBackingStore (pScreen);
     xf86SetBackingStore (pScreen);
 
     /* use dummy hw_cursro instead of sw_cursor */
     miDCInitialize (pScreen, xf86GetPointerScreenFuncs());
     xf86DrvMsg (pScrn->scrnIndex, X_INFO
                 , "Initializing HW Cursor\n");
-
+#if 1
     if (!xf86_cursors_init (pScreen, SEC_CURSOR_W, SEC_CURSOR_H,
                             (HARDWARE_CURSOR_TRUECOLOR_AT_8BPP |
                              HARDWARE_CURSOR_BIT_ORDER_MSBFIRST |
@@ -1037,7 +1215,7 @@ SECScreenInit (ScreenPtr pScreen, int argc, char **argv)
         xf86DrvMsg (pScrn->scrnIndex, X_ERROR
                     , "Hardware cursor initialization failed\n");
     }
-
+#endif
     /* crtc init */
     if (!xf86CrtcScreenInit (pScreen))
         return FALSE;
@@ -1082,10 +1260,18 @@ SECScreenInit (ScreenPtr pScreen, int argc, char **argv)
     secMemoryInstallHooks();
 #endif
 
+
 #if USE_XDBG
     xDbgLogPListInit (pScreen);
 #endif
-
+#if 0
+    xDbgLogSetLevel (MDRI2, 0);
+    xDbgLogSetLevel (MEXA, 0);
+    xDbgLogSetLevel (MLYRM, 0);
+#endif
+#ifdef NO_CRTC_MODE
+    pSec->isCrtcOn = secCrtcCheckInUseAll(pScrn);
+#endif
     XDBG_KLOG(MSEC, "Init Screen\n");
     return TRUE;
 }
@@ -1104,8 +1290,57 @@ SECAdjustFrame (ScrnInfoPtr pScrn, int x, int y)
 static Bool
 SECEnterVT (ScrnInfoPtr pScrn)
 {
+    SECPtr pSec = SECPTR (pScrn);
+    xf86OutputPtr pOutput;
+    SECCrtcPrivPtr pCrtcPriv;
+    xf86CrtcConfigPtr pXf86CrtcConfig;
+    int ret;
+    int i;
+
     xf86DrvMsg (pScrn->scrnIndex, X_INFO
                 , "EnterVT::Hardware state at EnterVT:\n");
+
+    if (pSec->drm_fd > 0)
+    {
+        ret = drmSetMaster (pSec->drm_fd);
+        if (ret)
+            xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "EnterVT::failed to set drm_fd %d as master.\n",
+                       pSec->drm_fd);
+    }
+
+    pXf86CrtcConfig = XF86_CRTC_CONFIG_PTR (pScrn);
+    for (i = 0; i < pXf86CrtcConfig->num_output; i++)
+    {
+        pOutput = pXf86CrtcConfig->output[i];
+        if (!strcmp(pOutput->name, "LVDS1") || !strcmp(pOutput->name, "HDMI1"))
+        {
+            xf86DrvMsg (pScrn->scrnIndex, X_INFO
+                        , "EnterVT::Find %s Output:\n", pOutput->name);
+
+            pCrtcPriv = pOutput->crtc->driver_private;
+
+            if (pCrtcPriv->bAccessibility || pCrtcPriv->screen_rotate_degree > 0)
+            {
+                tbm_bo src_bo = pCrtcPriv->front_bo;
+                tbm_bo dst_bo = pCrtcPriv->accessibility_back_bo;
+                if (!secCrtcExecAccessibility (pOutput->crtc, src_bo, dst_bo))
+                {
+                    xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "EnterVT::Fail execute accessibility(output name, %s)\n",
+                               pOutput->name);
+                }
+            }
+
+            /* set current fb to crtc */
+            if(!secCrtcApply(pOutput->crtc))
+            {
+                xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "EnterVT::Fail crtc apply(output name, %s)\n",
+                           pOutput->name);
+            }
+            return TRUE;
+        }
+    }
+
+    xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "EnterVT::failed to find Output.\n");
 
     return TRUE;
 }
@@ -1113,8 +1348,22 @@ SECEnterVT (ScrnInfoPtr pScrn)
 static void
 SECLeaveVT (ScrnInfoPtr pScrn)
 {
+    SECPtr pSec = SECPTR (pScrn);
+    int ret;
+
     xf86DrvMsg (pScrn->scrnIndex, X_INFO
                 , "LeaveVT::Hardware state at LeaveVT:\n");
+
+    if (pSec->drm_fd > 0)
+    {
+        ret = drmDropMaster (pSec->drm_fd);
+        if (ret)
+            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                       "LeaveVT::drmDropMaster failed for drmFD %d: %s\n",
+                       pSec->drm_fd, strerror(errno));
+        else
+            xf86DrvMsg (pScrn->scrnIndex, X_INFO, "LeaveVT::drmFD dropped master.\n");
+    }
 }
 
 static ModeStatus
@@ -1163,10 +1412,13 @@ SECCloseScreen (ScreenPtr pScreen)
     _secUdevDeinit(pScrn);
 #endif
 
+    secHwcDeinit (pScreen);
+#ifdef LAYER_MANAGER
+    secLayerMngDeInit(pScrn);
+#endif
     secVideoFini (pScreen);
     secExaDeinit (pScreen);
     secModeDeinit (pScrn);
-
     if (pSec->pFb)
     {
         secFbFree (pSec->pFb);
@@ -1226,9 +1478,8 @@ _secFbFreeBoData(void* data)
     bo_data = NULL;
 }
 
-
 static tbm_bo
-_secFbCreateBo (SECFbPtr pFb, int x, int y, int width, int height)
+_secFbCreateBo2 (SECFbPtr pFb, int x, int y, int width, int height, tbm_bo prev_bo, Bool clear)
 {
     XDBG_RETURN_VAL_IF_FAIL ((pFb != NULL), NULL);
     XDBG_RETURN_VAL_IF_FAIL ((width > 0), NULL);
@@ -1237,7 +1488,7 @@ _secFbCreateBo (SECFbPtr pFb, int x, int y, int width, int height)
     SECPtr pSec = SECPTR (pFb->pScrn);
 
     tbm_bo bo = NULL;
-    tbm_bo_handle bo_handle1, bo_handle2;
+    tbm_bo_handle bo_handle2;
     SECFbBoDataPtr bo_data=NULL;
     unsigned int pitch;
     unsigned int fb_id = 0;
@@ -1251,15 +1502,33 @@ _secFbCreateBo (SECFbPtr pFb, int x, int y, int width, int height)
     else
         flag = TBM_BO_DEFAULT;
 
-    bo = tbm_bo_alloc (pSec->tbm_bufmgr, pitch*height, flag);
-    XDBG_GOTO_IF_FAIL (bo != NULL, fail);
+    if (prev_bo != NULL)
+    {
+        XDBG_RETURN_VAL_IF_FAIL (tbm_bo_size(prev_bo)  >= (pitch*height), NULL);
 
-    /* memset 0x0 */
-    bo_handle1 = tbm_bo_map (bo, TBM_DEVICE_CPU, TBM_OPTION_WRITE);
-    XDBG_RETURN_VAL_IF_FAIL (bo_handle1.ptr != NULL, NULL);
+        tbm_bo_delete_user_data(prev_bo, TBM_BO_DATA_FB);
 
-    memset (bo_handle1.ptr, 0x0, pitch*height);
-    tbm_bo_unmap (bo);
+        /* TODO: check flags*/
+
+    	bo = prev_bo;
+    }
+    else
+    {
+        bo = tbm_bo_alloc (pSec->tbm_bufmgr, pitch*height, flag);
+        XDBG_GOTO_IF_FAIL (bo != NULL, fail);
+    }
+
+    if (clear)
+    {
+        tbm_bo_handle bo_handle1;
+
+        /* memset 0x0 */
+        bo_handle1 = tbm_bo_map (bo, TBM_DEVICE_CPU, TBM_OPTION_WRITE);
+        XDBG_RETURN_VAL_IF_FAIL (bo_handle1.ptr != NULL, NULL);
+
+        memset (bo_handle1.ptr, 0x0, pitch*height);
+        tbm_bo_unmap (bo);
+    }
 
     bo_handle2 = tbm_bo_get_handle(bo, TBM_DEVICE_DEFAULT);
 
@@ -1315,6 +1584,12 @@ fail:
     }
 
     return NULL;
+}
+
+static tbm_bo
+_secFbCreateBo (SECFbPtr pFb, int x, int y, int width, int height)
+{
+	return _secFbCreateBo2 (pFb, x, y, width, height, NULL, TRUE);
 }
 
 static tbm_bo
@@ -1543,7 +1818,7 @@ secFbResize (SECFbPtr pFb, int width, int height)
     BoxRec box;
     BoxPtr b1, b2;
 
-    if (pFb->width == width && pFb->height == height)
+    if ((pFb->width == width && pFb->height == height) || (pFb->width >= width && pFb->height >= height))
         return;
 
     old_bo = pFb->default_bo;
@@ -1737,6 +2012,16 @@ secRenderBoCreate (ScrnInfoPtr pScrn, int width, int height)
     SECPtr pSec = SECPTR (pScrn);
 
     return _secFbCreateBo(pSec->pFb, -1, -1, width, height);
+}
+
+int
+secSwapToRenderBo(ScrnInfoPtr pScrn, int width, int height, tbm_bo carr_bo, Bool clear)
+{
+    SECPtr pSec = SECPTR (pScrn);
+
+    tbm_bo tbo = _secFbCreateBo2(pSec->pFb, -1, -1, width, height, carr_bo, clear);
+
+	return tbo ? 1 : 0;
 }
 
 tbm_bo

@@ -278,7 +278,7 @@ static Bool SECXbercDump (int argc, char ** argv, RRPropertyValuePtr value, Scrn
         }
     } while ((c = strtok (NULL, ",")));
 
-    snprintf (pSec->dump_type, sizeof (pSec->dump_type), "bmp");
+    snprintf (pSec->dump_type, sizeof (pSec->dump_type), DUMP_TYPE_PNG);
     if (argc > 3)
     {
         int i;
@@ -289,8 +289,12 @@ static Bool SECXbercDump (int argc, char ** argv, RRPropertyValuePtr value, Scrn
                 buf_cnt = MIN((argv[i+1])?atoi(argv[i+1]):30,100);
             else if (!strcmp (c, "-type"))
             {
-                if (!strcmp (argv[i+1], "bmp") || !strcmp (argv[i+1], "raw"))
+                if (!strcmp (argv[i+1], DUMP_TYPE_PNG)
+                        || !strcmp (argv[i+1], DUMP_TYPE_BMP)
+                        || !strcmp (argv[i+1], DUMP_TYPE_RAW))
+                {
                     snprintf (pSec->dump_type, sizeof (pSec->dump_type), "%s", argv[i+1]);
+                }
             }
         }
     }
@@ -956,8 +960,8 @@ static struct
     },
 
     {
-        "dump", "to dump buffers", "[off,clear,drawable,fb,all]",
-        NULL, "[off,clear,drawable,fb,all] -count [n] -type [raw|bmp]",
+        "dump", "to dump buffers, default dump-format is png", "[off,clear,drawable,fb,all]",
+        NULL, "[off,clear,drawable,fb,all] -count [n] -type [raw|bmp|png]",
         SECXbercDump, NULL
     },
 
@@ -1230,7 +1234,7 @@ secXbercSetProperty (xf86OutputPtr output, Atom property, RRPropertyValuePtr val
     if (rr_property_atom != property)
     {
         _secXbercSetReturnProperty (value, "[Xberc]: Unrecognized property name.\n");
-        return TRUE;
+        return FALSE;
     }
 
     if (_secXbercParseArg (&argc, argv, value) == FALSE || argc < 1)

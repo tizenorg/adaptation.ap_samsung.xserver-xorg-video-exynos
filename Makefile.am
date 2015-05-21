@@ -20,3 +20,7 @@
 
 AUTOMAKE_OPTIONS = foreign
 SUBDIRS = src man
+if HAVE_FT
+SUBDIRS += tests/functional
+endif
+

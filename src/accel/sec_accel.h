@@ -50,6 +50,7 @@ typedef struct _secExaPriv SECExaPriv, *SECExaPrivPtr;
 #define CREATE_PIXMAP_USAGE_FB              0x101
 #define CREATE_PIXMAP_USAGE_SUB_FB          0x202
 #define CREATE_PIXMAP_USAGE_DRI2_BACK       0x404
+#define CREATE_PIXMAP_USAGE_DRI3_BACK       0x606
 #define CREATE_PIXMAP_USAGE_XVIDEO          0x808
 
 typedef struct
@@ -75,6 +76,10 @@ typedef struct
     /* Last update SBC */
     XID owner;
     CARD64 sbc;
+
+    /* for DRI3 */
+    int stride;
+    WindowPtr pWin;
 } SECPixmapPriv;
 
 /* exa driver private infomation */
@@ -135,6 +140,7 @@ void secExaScreenLock           (ScreenPtr pScreen, int enable);
 int  secExaScreenAsyncSwap      (ScreenPtr pScreen, int enable);
 int  secExaScreenSetScrnPixmap  (ScreenPtr pScreen);
 tbm_bo secExaPixmapGetBo    (PixmapPtr pPix);
+int secExaPixmapSetBo(PixmapPtr pPix, tbm_bo bo);
 
 /* sw EXA */
 Bool secExaSwInit   (ScreenPtr pScreen, ExaDriverPtr pExaDriver);
@@ -144,6 +150,17 @@ void secExaG2dDeinit (ScreenPtr pScreen);
 
 
 /**************************************************************************
+ * Present
+ **************************************************************************/
+/* Present */
+Bool secPresentScreenInit  		(ScreenPtr pScreen);
+/* Present event handlers (vblank, pageflip) */
+void secPresentVblankHandler	(unsigned int frame, unsigned int tv_sec, unsigned int tv_usec, void* event_data);
+void secPresentFlipEventHandler	(unsigned int frame, unsigned int tv_sec, unsigned int tv_usec, void* event_data, Bool flip_failed);
+void secPresentVblankAbort		(ScrnInfoPtr pScrn, xf86CrtcPtr pCrtc, void *data);
+void secPresentFlipAbort		(void* pageflip_data);
+
+/**************************************************************************
  * DRI2
  **************************************************************************/
 /* DRI2 */
@@ -151,5 +168,13 @@ Bool secDri2Init              (ScreenPtr pScreen);
 void secDri2Deinit            (ScreenPtr pScreen);
 void secDri2FrameEventHandler (unsigned int frame, unsigned int tv_sec, unsigned int tv_usec, void *event_data);
 void secDri2FlipEventHandler  (unsigned int frame, unsigned int tv_sec, unsigned int tv_usec, void *event_data, Bool flip_failed);
+void secDri2ProcessPending    (xf86CrtcPtr pCrtc, unsigned int frame, unsigned int tv_sec, unsigned int tv_usec);
+
+/**************************************************************************
+ * DRI3
+ **************************************************************************/
+/* DRI3 */
+Bool secDri3ScreenInit	  (ScreenPtr screen);
+
 
 #endif /* _SEC_ACCEL_H_ */

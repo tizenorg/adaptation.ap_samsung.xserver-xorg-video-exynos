@@ -153,7 +153,11 @@ SECExaFinishAccess (PixmapPtr pPix, int index)
 static void *
 SECExaCreatePixmap (ScreenPtr pScreen, int size, int align)
 {
+    TTRACE_GRAPHICS_BEGIN("XORG:EXA:CREATE_PIXMAP");
+
     SECPixmapPriv *privPixmap = calloc (1, sizeof (SECPixmapPriv));
+
+    TTRACE_GRAPHICS_END();
 
     return privPixmap;
 }
@@ -161,13 +165,16 @@ SECExaCreatePixmap (ScreenPtr pScreen, int size, int align)
 static void
 SECExaDestroyPixmap (ScreenPtr pScreen, void *driverPriv)
 {
+    TTRACE_GRAPHICS_BEGIN("XORG:EXA:DESTROY_PIXMAP");
+
     XDBG_RETURN_IF_FAIL (driverPriv != NULL);
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
     SECPtr pSec = SECPTR (pScrn);
 
     SECPixmapPriv *privPixmap = (SECPixmapPriv*)driverPriv;
 
-    XDBG_TRACE (MEXA, "DESTROY_PIXMAP : usage_hint:0x%x\n", privPixmap->usage_hint);
+    XDBG_TRACE (MEXA, "DESTROY_PIXMAP : bo:%p name:%d usage_hint:0x%x\n",
+        privPixmap->bo, tbm_bo_export(privPixmap->bo), privPixmap->usage_hint);
 
     switch(privPixmap->usage_hint)
     {
@@ -212,6 +219,11 @@ SECExaDestroyPixmap (ScreenPtr pScreen, void *driverPriv)
         tbm_bo_unref (privPixmap->bo);
         privPixmap->bo = NULL;
         break;
+    case CREATE_PIXMAP_USAGE_DRI3_BACK:
+        pSec->pix_dri3_back = pSec->pix_dri3_back - privPixmap->size;
+        tbm_bo_unref (privPixmap->bo);
+        privPixmap->bo = NULL;
+        break;
     case CREATE_PIXMAP_USAGE_BACKING_PIXMAP:
         pSec->pix_backing_pixmap = pSec->pix_backing_pixmap - privPixmap->size;
         tbm_bo_unref (privPixmap->bo);
@@ -226,6 +238,7 @@ SECExaDestroyPixmap (ScreenPtr pScreen, void *driverPriv)
 
     /* free pixmap private */
     free (privPixmap);
+    TTRACE_GRAPHICS_END();
 }
 
 static Bool
@@ -233,6 +246,8 @@ SECExaModifyPixmapHeader (PixmapPtr pPixmap, int width, int height,
                           int depth, int bitsPerPixel, int devKind, pointer pPixData)
 {
     XDBG_RETURN_VAL_IF_FAIL(pPixmap, FALSE);
+
+    TTRACE_GRAPHICS_BEGIN("XORG:EXA:MODIFY_PIXMAP_HEADER");
 
     ScrnInfoPtr pScrn = xf86Screens[pPixmap->drawable.pScreen->myNum];
     SECPtr pSec = SECPTR (pScrn);
@@ -257,6 +272,7 @@ SECExaModifyPixmapHeader (PixmapPtr pPixmap, int width, int height,
         XDBG_TRACE (MEXA, "CREATE_PIXMAP_FB(%p) : (x,y,w,h)=(%d,%d,%d,%d)\n",
                     pPixmap, pPixmap->drawable.x, pPixmap->drawable.y, width, height);
 
+        TTRACE_GRAPHICS_END();
         return TRUE;
     }
 
@@ -274,8 +290,10 @@ SECExaModifyPixmapHeader (PixmapPtr pPixmap, int width, int height,
         XDBG_TRACE (MEXA, "CREATE_PIXMAP_SUB_FB(%p) : (x,y,w,h)=(%d,%d,%d,%d)\n",
                     pPixmap, pPixmap->drawable.x, pPixmap->drawable.y, width, height);
 
+        TTRACE_GRAPHICS_END();
         return TRUE;
     }
+#if 0
     else if(pPixmap->usage_hint == CREATE_PIXMAP_USAGE_OVERLAY)
     {
         SECModePtr pSecMode = (SECModePtr) SECPTR (pScrn)->pSecMode;
@@ -321,8 +339,10 @@ SECExaModifyPixmapHeader (PixmapPtr pPixmap, int width, int height,
         XDBG_TRACE (MEXA, "CREATE_PIXMAP_OVERLAY(%p) : (x,y,w,h)=(%d,%d,%d,%d)\n",
                     pPixmap, pPixmap->drawable.x, pPixmap->drawable.y, width, height);
 
+        TTRACE_GRAPHICS_END();
         return TRUE;
     }
+#endif
     else if(pPixmap->usage_hint == CREATE_PIXMAP_USAGE_XVIDEO)
     {
         SECCvtProp prop = {0,};
@@ -334,13 +354,16 @@ SECExaModifyPixmapHeader (PixmapPtr pPixmap, int width, int height,
         prop.crop.width = width;
         prop.crop.height = height;
 
-        secCvtEnsureSize (NULL, &prop);
+        if (!secCvtEnsureSize (NULL, &prop))
+            return FALSE;
 
         privPixmap->bo = secRenderBoCreate(pScrn, prop.width, prop.height);
         if (!privPixmap->bo)
         {
             XDBG_ERROR (MEXA, "Error: cannot create a xvideo buffer\n");
             privPixmap->bo = old_bo;
+
+            TTRACE_GRAPHICS_END();
             return FALSE;
         }
 
@@ -359,14 +382,16 @@ SECExaModifyPixmapHeader (PixmapPtr pPixmap, int width, int height,
         if (old_bo)
             tbm_bo_unref (old_bo);
 
+        TTRACE_GRAPHICS_END();
         return TRUE;
     }
     else if(pPixmap->usage_hint == CREATE_PIXMAP_USAGE_DRI2_FLIP_BACK)
     {
-        privPixmap->bo = secRenderBoCreate(pScrn, width, height);
+        privPixmap->bo = secRenderBoCreate(pScrn, pPixmap->devKind / 4, height);
         if (!privPixmap->bo)
         {
             XDBG_ERROR (MEXA, "Error: cannot create a back flip buffer\n");
+            TTRACE_GRAPHICS_END();
             return FALSE;
         }
         lSizeInBytes = pPixmap->drawable.height * pPixmap->devKind;
@@ -379,6 +404,7 @@ SECExaModifyPixmapHeader (PixmapPtr pPixmap, int width, int height,
         XDBG_TRACE (MEXA, "CREATE_PIXMAP_DRI2_FLIP_BACK(%p) : bo:%p (x,y,w,h)=(%d,%d,%d,%d)\n",
                     pPixmap, privPixmap->bo, pPixmap->drawable.x, pPixmap->drawable.y, width, height);
 
+        TTRACE_GRAPHICS_END();
         return TRUE;
     }
     else if (pPixmap->usage_hint == CREATE_PIXMAP_USAGE_DRI2_BACK)
@@ -386,10 +412,14 @@ SECExaModifyPixmapHeader (PixmapPtr pPixmap, int width, int height,
         lSizeInBytes = pPixmap->drawable.height * pPixmap->devKind;
         privPixmap->usage_hint = pPixmap->usage_hint;
 
-        privPixmap->bo = tbm_bo_alloc (pSec->tbm_bufmgr, lSizeInBytes, TBM_BO_DEFAULT);
+        if (pSec->use_hwc)
+            privPixmap->bo = secRenderBoCreate(pScrn, pPixmap->devKind / 4, height);
+        else
+            privPixmap->bo = tbm_bo_alloc (pSec->tbm_bufmgr, lSizeInBytes, TBM_BO_DEFAULT);
         if (privPixmap->bo == NULL)
         {
-            XDBG_ERROR(MEXA, "Error on allocating BufferObject. size:%d\n",lSizeInBytes);
+            XDBG_ERROR(MEXA, "Error on allocating BufferObject. size:%ld\n",lSizeInBytes);
+            TTRACE_GRAPHICS_END();
             return FALSE;
         }
         pSec->pix_dri2_back = pSec->pix_dri2_back + lSizeInBytes;
@@ -399,18 +429,50 @@ SECExaModifyPixmapHeader (PixmapPtr pPixmap, int width, int height,
                     pPixmap, privPixmap->bo,
                     pPixmap->drawable.x, pPixmap->drawable.y, width, height);
 
+        TTRACE_GRAPHICS_END();
         return TRUE;
 
     }
-    else if (pPixmap->usage_hint == CREATE_PIXMAP_USAGE_BACKING_PIXMAP)
+    else if (pPixmap->usage_hint == CREATE_PIXMAP_USAGE_DRI3_BACK)
     {
         lSizeInBytes = pPixmap->drawable.height * pPixmap->devKind;
         privPixmap->usage_hint = pPixmap->usage_hint;
 
-        privPixmap->bo = tbm_bo_alloc (pSec->tbm_bufmgr, lSizeInBytes, TBM_BO_DEFAULT);
+        /* [cyeon] pixmap tbm bo will be attached in SECDRI3PixmapFromFd
+         */
+        privPixmap->bo = NULL;
+
+        pSec->pix_dri3_back = pSec->pix_dri3_back + lSizeInBytes;
+        privPixmap->size = lSizeInBytes;
+
+        XDBG_TRACE (MEXA, "CREATE_PIXMAP_USAGE_DRI3_BACK(%p) : (x,y,w,h)=(%d,%d,%d,%d)\n",
+                    pPixmap,
+                    pPixmap->drawable.x, pPixmap->drawable.y, width, height);
+
+        TTRACE_GRAPHICS_END();
+        return TRUE;
+    }
+#if 1
+    else if (pPixmap->usage_hint == CREATE_PIXMAP_USAGE_BACKING_PIXMAP ||
+             pPixmap->usage_hint == CREATE_PIXMAP_USAGE_OVERLAY)
+    {
+        lSizeInBytes = pPixmap->drawable.height * pPixmap->devKind;
+        privPixmap->usage_hint = pPixmap->usage_hint;
+
+        /*
+         * Each "backing pixmap" can be used as frame buffer through HWC extension.
+         * We may use a map/unmap construction in HWC extension before
+         * frame buffer will be used (look drmModeSetPlane()), but this way
+         * works better (without artifacts).
+         */
+        if (pSec->use_hwc)
+            privPixmap->bo = secRenderBoCreate(pScrn, pPixmap->devKind / 4, height);
+        else
+            privPixmap->bo = tbm_bo_alloc (pSec->tbm_bufmgr, lSizeInBytes, TBM_BO_DEFAULT);
         if (privPixmap->bo == NULL)
         {
-            XDBG_ERROR(MEXA, "Error on allocating BufferObject. size:%d\n",lSizeInBytes);
+            XDBG_ERROR(MEXA, "Error on allocating BufferObject. size:%ld\n",lSizeInBytes);
+            TTRACE_GRAPHICS_END();
             return FALSE;
         }
         pSec->pix_backing_pixmap = pSec->pix_backing_pixmap + lSizeInBytes;
@@ -420,10 +482,11 @@ SECExaModifyPixmapHeader (PixmapPtr pPixmap, int width, int height,
                     pPixmap, privPixmap->bo,
                     pPixmap->drawable.x, pPixmap->drawable.y, width, height);
 
+        TTRACE_GRAPHICS_END();
         return TRUE;
 
     }
-
+#endif
     if(privPixmap->bo != NULL)
     {
         tbm_bo_unref (privPixmap->bo);
@@ -449,10 +512,14 @@ SECExaModifyPixmapHeader (PixmapPtr pPixmap, int width, int height,
         /* create the pixmap private memory */
         if (lSizeInBytes && privPixmap->bo == NULL)
         {
-            privPixmap->bo = tbm_bo_alloc (pSec->tbm_bufmgr, lSizeInBytes, TBM_BO_DEFAULT);
+            if (pSec->hwc_active)
+                privPixmap->bo = secRenderBoCreate(pScrn, pPixmap->devKind / 4, height);
+            else
+                privPixmap->bo = tbm_bo_alloc (pSec->tbm_bufmgr, lSizeInBytes, TBM_BO_DEFAULT);
             if (privPixmap->bo == NULL)
             {
-                XDBG_ERROR(MEXA, "Error on allocating BufferObject. size:%d\n",lSizeInBytes);
+                XDBG_ERROR(MEXA, "Error on allocating BufferObject. size:%ld\n",lSizeInBytes);
+                TTRACE_GRAPHICS_END();
                 return FALSE;
             }
         }
@@ -464,6 +531,7 @@ SECExaModifyPixmapHeader (PixmapPtr pPixmap, int width, int height,
                 width, height,
                 pPixmap->drawable.x, pPixmap->drawable.y);
 
+    TTRACE_GRAPHICS_END();
     return TRUE;
 }
 
@@ -507,7 +575,7 @@ secExaInit (ScreenPtr pScreen)
     pExaDriver->maxX = 1 << 16;
     pExaDriver->maxY = 1 << 16;
     pExaDriver->pixmapOffsetAlign = 0;
-    pExaDriver->pixmapPitchAlign = 8;
+    pExaDriver->pixmapPitchAlign = 64;
     pExaDriver->flags = (EXA_OFFSCREEN_PIXMAPS | EXA_HANDLES_PIXMAPS
                          |EXA_SUPPORTS_OFFSCREEN_OVERLAPS
                          |EXA_SUPPORTS_PREPARE_AUX);
@@ -639,7 +707,8 @@ secExaMigratePixmap (PixmapPtr pPix, tbm_bo bo)
 {
     SECPixmapPriv *privPixmap = exaGetPixmapDriverPrivate (pPix);
 
-    tbm_bo_unref (privPixmap->bo);
+    if (privPixmap->bo)
+        tbm_bo_unref (privPixmap->bo);
     privPixmap->bo = tbm_bo_ref(bo);
 
     return TRUE;

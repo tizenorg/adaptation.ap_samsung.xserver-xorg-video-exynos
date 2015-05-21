@@ -36,7 +36,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <list.h>
 #include <xdbg.h>
 #include "fimg2d.h"
-
+#include "xf86.h"
 #include "sec.h"
 #include "property.h"
 #include "sec_display.h"
@@ -52,6 +52,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define MEXAS   XDBG_M('E','X','A','S')
 #define MEVT    XDBG_M('E','V','T',0)
 #define MDRI2   XDBG_M('D','R','I','2')
+#define MDRI3   XDBG_M('D','R','I','3')
 #define MCRS    XDBG_M('C','R','S',0)
 #define MFLIP   XDBG_M('F','L','I','P')
 #define MDPMS   XDBG_M('D','P','M','S')
@@ -68,6 +69,11 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define MCVT    XDBG_M('C','V','T',0)
 #define MEXAH   XDBG_M('E','X','A','H')
 #define MG2D    XDBG_M('G','2','D',0)
+#define MDOUT   XDBG_M('D','O','T',0)
+#define MCLON   XDBG_M('C','L','O','N')
+#define MHWC    XDBG_M('H','W','C',0)
+#define MLYRM   XDBG_M('L','Y','R','M')
+#define MHWA    XDBG_M('H','W','A',0)
 
 #define _XID(win)   ((unsigned int)(((WindowPtr)win)->drawable.id))
 
@@ -77,20 +83,38 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define UTIL_DUMP_ERR_SEGSIZE    3
 #define UTIL_DUMP_ERR_CONFIG     4
 #define UTIL_DUMP_ERR_INTERNAL   5
+#define UTIL_DUMP_ERR_PNG        6
 
 #define rgnSAME	3
 
 #define DUMP_DIR "/tmp/xdump"
 
-int secUtilDumpBmp (const char * file, const void * data, int width, int height);
+# ifdef LONG64
+#  define PRIXID	"u"
+# else
+#  define PRIXID	"lu"
+# endif
+
+#define EARLY_ERROR_MSG(ARG...) do { xf86ErrorFVerb ( 0, ##ARG); } while(0)
+
+typedef union
+{
+    void* ptr;
+    uint32_t u32;
+    uint64_t u64;
+} uniType;
+//int secUtilDumpBmp (const char * file, const void * data, int width, int height);
 int secUtilDumpRaw (const char * file, const void * data, int size);
 int secUtilDumpShm (int shmid, const void * data, int width, int height);
 int secUtilDumpPixmap (const char * file, PixmapPtr pPixmap);
 
 void* secUtilPrepareDump (ScrnInfoPtr pScrn, int bo_size, int buf_cnt);
 void  secUtilDoDumpRaws  (void *dump, tbm_bo *bo, int *size, int bo_cnt, const char *file);
-void  secUtilDoDumpBmps  (void *d, tbm_bo bo, int w, int h, xRectangle *crop, const char *file);
-void  secUtilDoDumpPixmaps (void *d, PixmapPtr pPixmap, const char *file);
+
+void  secUtilDoDumpBmps  (void *d, tbm_bo bo, int w, int h, xRectangle *crop, const char *file, const char* dumpType);
+
+void  secUtilDoDumpPixmaps (void *d, PixmapPtr pPixmap, const char *file, const char* dumpType);
+
 void  secUtilDoDumpVBuf  (void *d, SECVideoBuf *vbuf, const char *file);
 void  secUtilFlushDump   (void *dump);
 void  secUtilFinishDump  (void *dump);
@@ -132,20 +156,23 @@ Bool secUtilConvertImage (pixman_op_t op, uchar *srcbuf, uchar *dstbuf,
                           int dw, int dh, xRectangle *dr,
                           RegionPtr dst_clip_region,
                           int rotate, int hflip, int vflip);
-void secUtilConvertBos (ScrnInfoPtr pScrn,
+
+void secUtilConvertBos (ScrnInfoPtr pScrn, int src_id,
                         tbm_bo src_bo, int sw, int sh, xRectangle *sr, int sstride,
                         tbm_bo dst_bo, int dw, int dh, xRectangle *dr, int dstride,
                         Bool composite, int rotate);
 
-void secUtilFreeHandle        (ScrnInfoPtr scrn, unsigned int handle);
+void secUtilFreeHandle        (ScrnInfoPtr scrn, uint32_t handle);
+#ifdef LEGACY_INTERFACE
 Bool secUtilConvertPhyaddress (ScrnInfoPtr scrn, unsigned int phy_addr, int size, unsigned int *handle);
 Bool secUtilConvertHandle     (ScrnInfoPtr scrn, unsigned int handle, unsigned int *phy_addr, int *size);
+#endif
 
-typedef void (*DestroyDataFunc) (void *func_data, void *key_data);
+typedef void (*DestroyDataFunc) (void *func_data, uniType key_data);
 
-void* secUtilListAdd     (void *list, void *key, void *key_data);
+void* secUtilListAdd     (void *list, void *key, uniType user_data);
 void* secUtilListRemove  (void *list, void *key);
-void* secUtilListGetData (void *list, void *key);
+uniType secUtilListGetData (void *list, void *key);
 Bool  secUtilListIsEmpty (void *list);
 void  secUtilListDestroyData (void *list, DestroyDataFunc func, void *func_data);
 void  secUtilListDestroy (void *list);
@@ -159,11 +186,12 @@ G2dColorMode  secUtilGetG2dFormat (unsigned int id);
 unsigned int  secUtilGetDrmFormat (unsigned int id);
 SECFormatType secUtilGetColorType (unsigned int id);
 
+SECVideoBuf*  secUtilCreateVideoBufferByDraw(DrawablePtr pDraw);
 SECVideoBuf* _secUtilAllocVideoBuffer  (ScrnInfoPtr scrn, int id, int width, int height,
                                         Bool scanout, Bool reset, Bool secure, const char *func);
 SECVideoBuf* _secUtilCreateVideoBuffer (ScrnInfoPtr scrn, int id, int width, int height,
                                         Bool secure, const char *func);
-SECVideoBuf* secUtilVideoBufferRef     (SECVideoBuf *vbuf);
+SECVideoBuf* _secUtilVideoBufferRef     (SECVideoBuf *vbuf, const char *func);
 void         _secUtilVideoBufferUnref  (SECVideoBuf *vbuf, const char *func);
 void         _secUtilFreeVideoBuffer   (SECVideoBuf *vbuf, const char *func);
 void         secUtilClearVideoBuffer   (SECVideoBuf *vbuf);
@@ -173,14 +201,21 @@ typedef void (*FreeVideoBufFunc) (SECVideoBuf *vbuf, void *data);
 void         secUtilAddFreeVideoBufferFunc     (SECVideoBuf *vbuf, FreeVideoBufFunc func, void *data);
 void         secUtilRemoveFreeVideoBufferFunc  (SECVideoBuf *vbuf, FreeVideoBufFunc func, void *data);
 
+uniType setunitype32(uint32_t data_u32);
+
 #define secUtilAllocVideoBuffer(s,i,w,h,c,r,d)  _secUtilAllocVideoBuffer(s,i,w,h,c,r,d,__FUNCTION__)
 #define secUtilCreateVideoBuffer(s,i,w,h,d)     _secUtilCreateVideoBuffer(s,i,w,h,d,__FUNCTION__)
 #define secUtilVideoBufferUnref(v)  _secUtilVideoBufferUnref(v,__FUNCTION__)
+#define secUtilVideoBufferRef(v)  _secUtilVideoBufferRef(v,__FUNCTION__)
 #define secUtilFreeVideoBuffer(v)   _secUtilFreeVideoBuffer(v,__FUNCTION__)
 #define secUtilIsVbufValid(v)       _secUtilIsVbufValid(v,__FUNCTION__)
 #define VBUF_IS_VALID(v)            secUtilIsVbufValid(v)
 #define VSTMAP(v)            ((v)?(v)->stamp:0)
 #define VBUF_IS_CONVERTING(v)       (!xorg_list_is_empty (&((v)->convert_info)))
+
+int findActiveConnector (ScrnInfoPtr pScrn);
+
+ScrnInfoPtr  secUtilDrawToScrn(DrawablePtr pDraw);
 
 /* for debug */
 char*  secUtilDumpVideoBuffer (char *reply, int *len);

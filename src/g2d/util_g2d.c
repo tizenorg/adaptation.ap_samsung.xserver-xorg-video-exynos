@@ -1,4 +1,8 @@
+#include <xorg-server.h>
 #include <stdio.h>
+#include <stdio.h>
+
+#include <xorg-server.h>
 #include "xf86.h"
 #include "fimg2d.h"
 #include "sec_util.h"

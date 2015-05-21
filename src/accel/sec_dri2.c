@@ -60,6 +60,8 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "sec_util.h"
 #include "sec_crtc.h"
 #include "sec_xberc.h"
+#include "sec_layer_manager.h"
+#include "sec_hwc.h"
 
 #define DRI2_BUFFER_TYPE_WINDOW 0x0
 #define DRI2_BUFFER_TYPE_PIXMAP 0x1
@@ -112,8 +114,14 @@ static void SECDri2DestroyBuffer (DrawablePtr pDraw, DRI2BufferPtr pBuf);
 static PixmapPtr _initBackBufPixmap     (DRI2BufferPtr pBackBuf, DrawablePtr pDraw, Bool canFlip);
 static void      _deinitBackBufPixmap   (DRI2BufferPtr pBackBuf, DrawablePtr pDraw, Bool canFlip);
 static void      _exchangeBackBufPixmap (DRI2BufferPtr pBackBuf);
-static PixmapPtr _reuseBackBufPixmap    (DRI2BufferPtr pBackBuf, DrawablePtr pDraw, Bool canFlip, int *reues);
 static void      _disuseBackBufPixmap   (DRI2BufferPtr pBackBuf, DRI2FrameEventPtr pEvent);
+static PixmapPtr _reuseBackBufPixmap    (DRI2BufferPtr pBackBuf, DrawablePtr pDraw, Bool canFlip, int *reues);
+static Bool      _scheduleLayerFlip     (DrawablePtr pDraw, DRI2FrameEventPtr pEvent);
+static void      _bo_swap               (tbm_bo back_bo, tbm_bo front_bo);
+
+#ifdef LAYER_MANAGER
+static SECLayerMngClientID lyr_client_id = 0;
+#endif
 
 static unsigned int
 _getName (PixmapPtr pPix)
@@ -138,6 +146,119 @@ _getName (PixmapPtr pPix)
     return tbm_bo_export (pExaPixPriv->bo);
 }
 
+static PixmapPtr *
+_createBackPixmaps (DrawablePtr pDraw, DRI2BufferPtr pBuf, Bool flip)
+{
+    ScreenPtr pScreen = pDraw->pScreen;
+    ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
+    SECPtr pSec = SECPTR(pScrn);
+    DRI2BufferPrivPtr pBufPriv = pBuf->driverPrivate;
+    int i;
+
+#ifdef SIMPLE_DRI2
+    pBufPriv->num_buf = 1;
+#else
+    if (flip)
+        pBufPriv->num_buf = SECEXAPTR (pSec)->flip_backbufs;
+    else
+        pBufPriv->num_buf = 1;
+#endif
+
+    pBufPriv->pBackPixmaps = calloc (SECEXAPTR (pSec)->flip_backbufs, sizeof (void*));
+    XDBG_RETURN_VAL_IF_FAIL (pBufPriv->pBackPixmaps != NULL, NULL);
+
+    for (i = 0; i < pBufPriv->num_buf; i++)
+    {
+        pBufPriv->pBackPixmaps[i] = (*pScreen->CreatePixmap)(pScreen, pDraw->width, pDraw->height, pDraw->depth,
+                CREATE_PIXMAP_USAGE_DRI2_FLIP_BACK);
+        XDBG_GOTO_IF_FAIL (pBufPriv->pBackPixmaps[i] != NULL, fail);
+#if USE_XDBG
+        xDbgLogPListDrawAddRefPixmap (pDraw, pBufPriv->pBackPixmaps[i]);
+#endif
+
+        SECPixmapPriv * pPixPriv = exaGetPixmapDriverPrivate(pBufPriv->pBackPixmaps[i]);
+        XDBG_DEBUG (MDRI2, "[%p] Allocate Backbuffer(%d): pix=%p name=%d\n",
+                (void *)pDraw->id, i, pBufPriv->pBackPixmaps[i],
+                tbm_bo_export(pPixPriv->bo));
+    }
+
+    pBufPriv->canFlip = flip;
+    pBufPriv->avail_idx = 0;
+    pBufPriv->free_idx = 0;
+    pBufPriv->cur_idx = 0;
+    pBufPriv->pipe = 0;     //at this case it is unimportant
+
+    return pBufPriv->pBackPixmaps;
+
+fail:
+    for (i = 0; i <  pBufPriv->num_buf; i++)
+    {
+        if (pBufPriv->pBackPixmaps[i] != NULL)
+        {
+            xDbgLogPListDrawRemoveRefPixmap (pDraw, pBufPriv->pBackPixmaps[i]);
+            (*pScreen->DestroyPixmap) (pBufPriv->pBackPixmaps[i]);
+            pBufPriv->pBackPixmaps[i] = NULL;
+        }
+    }
+
+    if (pBufPriv->pBackPixmaps)
+    {
+        free (pBufPriv->pBackPixmaps);
+        pBufPriv->pBackPixmaps = NULL;
+    }
+
+    return NULL;
+}
+
+static PixmapPtr
+_getBackPixmap (DrawablePtr pDraw, DRI2BufferPtr pBuf, Bool flip)
+{
+    ScreenPtr pScreen = pDraw->pScreen;
+    DRI2BufferPrivPtr pBufPriv = pBuf->driverPrivate;
+
+    PixmapPtr pPixmap = NULL;
+    SECPixmapPriv * pPixPriv  = NULL;
+
+    if (!pBufPriv->pBackPixmaps)
+    {
+        XDBG_RETURN_VAL_IF_FAIL (_createBackPixmaps (pDraw, pBuf, flip), NULL);
+    }
+    else
+    {
+        //increase the number of back buffers when SWAP->FLIP, but never decrease
+        if (flip && pBufPriv->num_buf < 2)
+            pBufPriv->num_buf = 2;
+    }
+
+    if (pBufPriv->pBackPixmaps[pBufPriv->avail_idx] == NULL)
+    {
+        pBufPriv->pBackPixmaps[pBufPriv->avail_idx] = (*pScreen->CreatePixmap)(pScreen, pDraw->width, pDraw->height, pDraw->depth,
+                CREATE_PIXMAP_USAGE_DRI2_FLIP_BACK);
+        XDBG_RETURN_VAL_IF_FAIL(pBufPriv->pBackPixmaps[pBufPriv->avail_idx] != NULL, NULL);
+#if USE_XDBG
+        xDbgLogPListDrawAddRefPixmap (pDraw, pBufPriv->pBackPixmaps[i]);
+#endif
+
+        pPixmap = pBufPriv->pBackPixmaps[pBufPriv->avail_idx];
+
+        pPixPriv = exaGetPixmapDriverPrivate(pBufPriv->pBackPixmaps[pBufPriv->avail_idx]);
+        XDBG_DEBUG (MDRI2, "[%p] Allocate Backbuffer(%d): pix=%p name=%d\n",
+                (void *)pDraw->id, pBufPriv->avail_idx, pBufPriv->pBackPixmaps[pBufPriv->avail_idx],
+                tbm_bo_export(pPixPriv->bo));
+    }
+    else
+    {
+        pPixmap = pBufPriv->pBackPixmaps[pBufPriv->avail_idx];
+
+        pPixPriv = exaGetPixmapDriverPrivate(pPixmap);
+        XDBG_DEBUG (MDRI2, "[%p] Get Backbuffer(%d): pix=%p name=%d\n",
+                (void *)pDraw->id, pBufPriv->avail_idx, pPixmap,
+                tbm_bo_export(pPixPriv->bo));
+    }
+
+    return pPixmap;
+}
+
 /* initialize the pixmap of the backbuffer */
 static PixmapPtr
 _initBackBufPixmap (DRI2BufferPtr pBackBuf, DrawablePtr pDraw, Bool canFlip)
@@ -150,6 +271,12 @@ _initBackBufPixmap (DRI2BufferPtr pBackBuf, DrawablePtr pDraw, Bool canFlip)
     unsigned int usage_hint = CREATE_PIXMAP_USAGE_DRI2_BACK;
     PixmapPtr pPixmap = NULL;
     int pipe = -1;
+
+    /* HWComposite */
+    if (pSec->hwc_active)
+    {
+       return _getBackPixmap (pDraw, pBackBuf, canFlip);
+    }
 
     /* if a drawable can be flip, check whether the flip buffer is available */
     if (canFlip)
@@ -171,7 +298,9 @@ _initBackBufPixmap (DRI2BufferPtr pBackBuf, DrawablePtr pDraw, Bool canFlip)
         {
             /* pipe is -1 */
             canFlip = FALSE;
-            XDBG_WARNING(MDRI2, "pipe is -1");
+#ifndef NO_CRTC_MODE
+            XDBG_WARNING(MDRI2, "pipe is -1\n");
+#endif
         }
     }
 
@@ -226,7 +355,7 @@ _deinitBackBufPixmap (DRI2BufferPtr pBackBuf, DrawablePtr pDraw, Bool canFlip)
         {
             if(pBackBufPriv->pBackPixmaps[i])
             {
-                if (canFlip)
+                if (canFlip && (!SECPTR(pScrn)->hwc_active))
                 {
                     /* have to release the flip pixmap */
                     pipe = pBackBufPriv->pipe;
@@ -245,10 +374,10 @@ _deinitBackBufPixmap (DRI2BufferPtr pBackBuf, DrawablePtr pDraw, Bool canFlip)
                 pBackBufPriv->pBackPixmaps[i] = NULL;
                 pBackBufPriv->pPixmap = NULL;
             }
-            free(pBackBufPriv->pBackPixmaps);
-            pBackBufPriv->pBackPixmaps = NULL;
         }
     }
+    free(pBackBufPriv->pBackPixmaps);
+    pBackBufPriv->pBackPixmaps = NULL;
 }
 
 /* increase the next available index of the backbuffer */
@@ -272,6 +401,14 @@ _reuseBackBufPixmap (DRI2BufferPtr pBackBuf, DrawablePtr pDraw, Bool canFlip, in
     int avail_idx = pBackBufPriv->avail_idx;
     unsigned int usage_hint = CREATE_PIXMAP_USAGE_DRI2_BACK;
     int pipe = -1;
+
+    if (SECPTR (pScrn)->hwc_active)
+    {
+            *reues = 1;
+            pPixmap = _getBackPixmap(pDraw, pBackBuf, canFlip);
+            pBackBufPriv->canFlip = canFlip;
+            return pPixmap;
+    }
 
     if (pBackBufPriv->canFlip != canFlip)
     {
@@ -401,7 +538,6 @@ _reuseBackBufPixmap (DRI2BufferPtr pBackBuf, DrawablePtr pDraw, Bool canFlip, in
     pPixmap = pBackBufPriv->pBackPixmaps[avail_idx];
 
     pBackBufPriv->canFlip = canFlip;
-
     return pPixmap;
 }
 
@@ -414,9 +550,11 @@ _disuseBackBufPixmap (DRI2BufferPtr pBackBuf, DRI2FrameEventPtr pEvent)
 
     if (pEvent->type == DRI2_FLIP)
     {
-        secCrtcRelFlipPixmap (pScrn, pEvent->crtc_pipe,
-                pBackBufPriv->pBackPixmaps[pBackBufPriv->free_idx]);
-
+        if (!SECPTR(pScrn)->hwc_active)
+        {
+            secCrtcRelFlipPixmap (pScrn, pEvent->crtc_pipe,
+                    pBackBufPriv->pBackPixmaps[pBackBufPriv->free_idx]);
+        }
         /* increase free_idx when buffers destory or when frame is deleted */
         pBackBufPriv->free_idx = DRI2_GET_NEXT_IDX(pBackBufPriv->free_idx, pBackBufPriv->num_buf);
     }
@@ -495,17 +633,27 @@ _canFlip (DrawablePtr pDraw)
     PixmapPtr pWinPixmap, pRootPixmap;
     int ret;
 
+    if (!pSec->use_flip)
+        return FALSE;
+
     if (pDraw->type == DRAWABLE_PIXMAP)
         return FALSE;
+
+    if (!IS_VIEWABLE(pDraw))
+        return FALSE;
+
+    if (pSec->hwc_active && !pSec->hwc_use_def_layer)
+    {
+        if (secHwcIsDrawExist(pDraw))
+            return TRUE;
+        return FALSE;
+    }
 
     pRoot = pScreen->root;
     pRootPixmap = pScreen->GetWindowPixmap (pRoot);
     pWin = (WindowPtr) pDraw;
     pWinPixmap = pScreen->GetWindowPixmap (pWin);
     if (pRootPixmap != pWinPixmap)
-        return FALSE;
-
-    if (!IS_VIEWABLE(pDraw))
         return FALSE;
 
     ret = secFbFindBo(pSec->pFb,
@@ -567,7 +715,7 @@ _getSwapType (DrawablePtr pDraw, DRI2BufferPtr pFrontBuf,
 
             if (!_canFlip(pDraw))
             {
-                ErrorF ("@@@ [%10.3f] %lx : flip to blit\n", GetTimeInMillis()/1000.0, pDraw->id);
+                ErrorF ("@@@ [%10.3f] %"PRIXID" : flip to blit\n", GetTimeInMillis()/1000.0, pDraw->id);
                 swap_type = DRI2_BLIT;
             }
         }
@@ -592,7 +740,12 @@ _getSwapType (DrawablePtr pDraw, DRI2BufferPtr pFrontBuf,
                 pFrontPix->drawable.height == pBackPix->drawable.height &&
                 pFrontPix->drawable.bitsPerPixel == pBackPix->drawable.bitsPerPixel)
             {
-                swap_type = DRI2_SWAP;
+                /*use swap only if flip is enable*/
+                ScrnInfoPtr pScrn = xf86ScreenToScrn(pDraw->pScreen);
+                if (SECPTR(pScrn)->use_flip)
+                    swap_type = DRI2_SWAP;
+                else
+                    swap_type = DRI2_BLIT;
             }
             else
             {
@@ -665,7 +818,7 @@ _resetBufPixmap (DrawablePtr pDraw, DRI2BufferPtr pBuf)
         pNewPix = _reuseBackBufPixmap(pBuf, pDraw, canFlip, &reuse);
         if (pNewPix == NULL)
         {
-            XDBG_WARNING (MDRI2, "Error pixmap is null\n", pipe);
+            XDBG_WARNING (MDRI2, "Error pixmap is null\n");
             return FALSE;
         }
 
@@ -681,7 +834,7 @@ _resetBufPixmap (DrawablePtr pDraw, DRI2BufferPtr pBuf)
     pBuf->name = _getName (pNewPix);
     pBuf->flags = _getBufferFlag(pDraw, canFlip);
 
-    XDBG_TRACE (MDRI2,"id:0x%x(%d) can_flip:%d attach:%d, name:%d, flags:0x%x geo(%dx%d+%d+%d)\n",
+    XDBG_TRACE (MDRI2,"id:0x%lx(%d) can_flip:%d attach:%d, name:%d, flags:0x%x geo(%dx%d+%d+%d)\n",
                 pDraw->id, pDraw->type,
                 pBufPriv->canFlip,
                 pBuf->attachment, pBuf->name, pBuf->flags,
@@ -754,27 +907,37 @@ _exchangeBuffers (DrawablePtr pDraw, DRI2FrameEventType type,
     SECPixmapPriv *pFrontExaPixPriv = exaGetPixmapDriverPrivate (pFrontBufPriv->pPixmap);
     SECPixmapPriv *pBackExaPixPriv = exaGetPixmapDriverPrivate (pBackBufPriv->pPixmap);
 
-    if(pFrontBufPriv->canFlip != pBackBufPriv->canFlip)
-    {
-        XDBG_WARNING (MDRI2, "Cannot exchange buffer(0x%x): Front(%d, canFlip:%d), Back(%d, canFlip:%d)\n",
-                      (unsigned int)pDraw->id, pFrontBuf->name, pFrontBufPriv->canFlip,
-                      pBackBuf->name, pBackBufPriv->canFlip);
-
-        return;
-    }
+//    if(pFrontBufPriv->canFlip != pBackBufPriv->canFlip)
+//    {
+//        XDBG_WARNING (MDRI2, "Cannot exchange buffer(0x%x): Front(%d, canFlip:%d), Back(%d, canFlip:%d)\n",
+//                      (unsigned int)pDraw->id, pFrontBuf->name, pFrontBufPriv->canFlip,
+//                      pBackBuf->name, pBackBufPriv->canFlip);
+//
+//        return;
+//    }
 
     /* exchange the buffers
      * 1. exchange the bo of the exa pixmap private
      * 2. get the name of the front buffer (the name of the back buffer will get next DRI2GetBuffers.)
      */
-    if (pFrontBufPriv->canFlip)
+    if (pFrontBufPriv->canFlip && !pSec->hwc_active)
     {
         XDBG_RETURN_IF_FAIL(NULL != secFbSwapBo(pSec->pFb, pBackExaPixPriv->bo));
         pFrontBuf->name = _getName (pFrontBufPriv->pPixmap);
     }
     else
     {
-        tbm_bo_swap(pFrontExaPixPriv->bo, pBackExaPixPriv->bo);
+        //Front pixmap can be screen pixmap which doesn't have bo. In this case
+        //secExaPrepareAccess() should be called.
+        tbm_bo front_bo = pFrontExaPixPriv->bo;
+        if (front_bo == NULL)
+        {
+            secExaPrepareAccess (pFrontBufPriv->pPixmap, EXA_PREPARE_DEST);
+            front_bo = pFrontExaPixPriv->bo;
+            secExaFinishAccess  (pFrontBufPriv->pPixmap, EXA_PREPARE_DEST);
+            XDBG_RETURN_IF_FAIL (front_bo != NULL);
+        }
+        _bo_swap(front_bo, pBackExaPixPriv->bo);
         pFrontBuf->name = _getName (pFrontBufPriv->pPixmap);
     }
 
@@ -850,7 +1013,7 @@ _swapFrame (DrawablePtr pDraw, DRI2FrameEventPtr pFrameEvent)
     switch (pFrameEvent->type)
     {
     case DRI2_FLIP:
-        _generateDamage (pDraw, pFrameEvent);
+        //_generateDamage (pDraw, pFrameEvent);
         break;
     case DRI2_SWAP:
         _exchangeBuffers (pDraw, pFrameEvent->type,
@@ -897,7 +1060,6 @@ _deleteFrame (DrawablePtr pDraw, DRI2FrameEventPtr pEvent)
     {
         /* disuse the backbuffer */
         _disuseBackBufPixmap(pEvent->pBackBuf, pEvent);
-
         SECDri2DestroyBuffer (pDraw, pEvent->pBackBuf);
     }
 
@@ -964,7 +1126,9 @@ _doPageFlip (DrawablePtr pDraw, int crtc_pipe, xf86CrtcPtr pCrtc, DRI2FrameEvent
     /* Reset buffer position */
     secRenderBoSetPos(pBackExaPixPriv->bo, pDraw->x, pDraw->y);
 
-    if (!secModePageFlip (pScrn, NULL, pEvent, crtc_pipe, pBackExaPixPriv->bo))
+    if (!secModePageFlip (pScrn, NULL, pEvent, crtc_pipe, pBackExaPixPriv->bo,
+    		pEvent->pRegion, pEvent->client_idx, pEvent->drawable_id,
+    		secDri2FlipEventHandler, FALSE))
     {
         XDBG_WARNING (MDRI2, "fail to secModePageFlip\n");
         return FALSE;
@@ -984,6 +1148,259 @@ _doPageFlip (DrawablePtr pDraw, int crtc_pipe, xf86CrtcPtr pCrtc, DRI2FrameEvent
     return TRUE;
 }
 
+void
+secDri2LayerFlipEventHandler (unsigned int frame, unsigned int tv_sec,
+                              unsigned int tv_usec, void *event_data, Bool flip_failed)
+{
+    DRI2FrameEventPtr pEvent;
+    DRI2FrameEventPtr pPendingEvent;
+    DRI2BufferPrivPtr pBackBufPriv;
+    DrawablePtr pDraw;
+    ClientPtr pClient;
+
+    TTRACE_GRAPHICS_BEGIN("XORG:DRI2:LAYER_FLIP_HANDLER");
+
+    pEvent = (DRI2FrameEventPtr) event_data;
+    XDBG_RETURN_IF_FAIL(pEvent != NULL);
+    pClient = pEvent->pClient;
+    pBackBufPriv = pEvent->pBackBuf->driverPrivate;
+
+    if (pEvent->drawable_id) dixLookupDrawable (&pDraw, pEvent->drawable_id, serverClient, M_ANY, DixWriteAccess);
+
+    if (!pDraw)
+    {
+        XDBG_WARNING ( MDRI2,"pDraw is null... Client:%d pipe:%d " "Front(attach:%d, name:%d, flag:0x%x),"
+                " Back(attach:%d, name:%d, flag:0x%x)\n", pClient->index, pBackBufPriv->pipe,
+                pEvent->pFrontBuf->attachment, pEvent->pFrontBuf->name, pEvent->pFrontBuf->flags,
+                pEvent->pBackBuf->attachment, pEvent->pBackBuf->name, pEvent->pBackBuf->flags);
+
+        DRI2SwapComplete (pEvent->pClient, pDraw, frame, tv_sec, tv_usec, DRI2_FLIP_COMPLETE,
+                          pEvent->event_complete, pEvent->event_data);
+
+        //delete event and save pending event 
+        pPendingEvent = pEvent->pPendingEvent;
+        _deleteFrame (pDraw, pEvent);
+        pBackBufPriv->pFlipEvent = NULL;
+
+        //delete pending event
+        if (pPendingEvent)
+        {
+            XDBG_TRACE ( MDRI2, "FlipEvent(%d,0x%x) (Break pending flip:draw is not found) Client:%d pipe:%d " "Front(attach:%d, name:%d, flag:0x%x),"
+                    " Back(attach:%d, name:%d, flag:0x%x)\n", pDraw->type, (unsigned int )pDraw->id, pClient->index, pBackBufPriv->pipe,
+                    pEvent->pFrontBuf->attachment, pEvent->pFrontBuf->name, pEvent->pFrontBuf->flags,
+                    pEvent->pBackBuf->attachment, pEvent->pBackBuf->name, pEvent->pBackBuf->flags);
+            _deleteFrame (pDraw, pEvent->pPendingEvent);
+        }
+
+        TTRACE_GRAPHICS_END();
+        return;
+    }
+
+    XDBG_TRACE ( MDRI2, "FlipEvent(%d,0x%x) Client:%d pipe:%d " "Front(attach:%d, name:%d, flag:0x%x),"
+            " Back(attach:%d, name:%d, flag:0x%x)\n", pDraw->type, (unsigned int )pDraw->id, pClient->index, pBackBufPriv->pipe,
+            pEvent->pFrontBuf->attachment, pEvent->pFrontBuf->name, pEvent->pFrontBuf->flags,
+            pEvent->pBackBuf->attachment, pEvent->pBackBuf->name, pEvent->pBackBuf->flags);
+
+    if (pBackBufPriv->num_buf == 1)
+    {
+        DRI2SwapComplete (pEvent->pClient, pDraw, frame, tv_sec, tv_usec, DRI2_FLIP_COMPLETE,
+                          pEvent->event_complete, pEvent->event_data);
+    }
+
+    if (pBackBufPriv->pFlipEvent == pEvent)
+    {
+        pPendingEvent = pEvent->pPendingEvent;
+        _deleteFrame (pDraw, pEvent);
+        pBackBufPriv->pFlipEvent = NULL;
+
+        if (pPendingEvent)
+        {
+            _scheduleLayerFlip (pDraw, pPendingEvent);
+        }
+    }
+    else
+    {
+        XDBG_NEVER_GET_HERE(MDRI2);
+    }
+
+    TTRACE_GRAPHICS_END();
+
+}
+
+
+static void
+_bo_swap (tbm_bo front_bo, tbm_bo back_bo)
+{
+    if(tbm_bo_swap(front_bo, back_bo))
+    {
+        SECFbBoDataPtr back_bo_data = NULL;
+        SECFbBoDataPtr bo_data = NULL;
+        SECFbBoDataRec tmp_bo_data;
+        tbm_bo_get_user_data(front_bo, TBM_BO_DATA_FB, (void * *)&bo_data);
+        tbm_bo_get_user_data(back_bo, TBM_BO_DATA_FB, (void * *)&back_bo_data);
+        if (back_bo_data && bo_data)
+        {
+            memcpy (&tmp_bo_data, bo_data, sizeof(SECFbBoDataRec));
+            memcpy (bo_data, back_bo_data, sizeof(SECFbBoDataRec));
+            memcpy (back_bo_data, &tmp_bo_data, sizeof(SECFbBoDataRec));
+            XDBG_DEBUG (MDRI2,"swap complete: front(bo:%p name:%d(%d) fb:%d) <-> back(bo:%p name:%d(%d) fb:%d)\n",
+                        front_bo, tbm_bo_export(front_bo),bo_data->gem_handle, bo_data->fb_id,
+                        back_bo,  tbm_bo_export(back_bo), back_bo_data->gem_handle, back_bo_data->fb_id);
+        }
+        else
+        {
+            XDBG_DEBUG (MDRI2,"swap complete: front(bo:%p name:%d) <-> back(bo:%p name:%d)\n",
+                        front_bo, tbm_bo_export(front_bo), back_bo,  tbm_bo_export(back_bo));
+            XDBG_WARNING (MDRI2,"user data is NULL: front(%p) back(%p)\n", bo_data, back_bo_data );
+        }
+    }
+    else
+    {
+        XDBG_ERROR (MDRI2,"swap fails\n");
+    }
+}
+
+static Bool
+_scheduleLayerFlip (DrawablePtr pDraw, DRI2FrameEventPtr pEvent)
+{
+
+    SECVideoBuf * vbuf = NULL;
+
+    /* TODO: the Draw can be in several layers and
+     * we should update frame buffer for each of them
+     */
+    XDBG_RETURN_VAL_IF_FAIL(pDraw != NULL, FALSE);
+    DRI2BufferPrivPtr pBackBufPriv = pEvent->pBackBuf->driverPrivate;
+    SECPtr pSec = SECPTR (xf86Screens[pDraw->pScreen->myNum]);
+    XDBG_RETURN_VAL_IF_FAIL(pSec != NULL, FALSE;)
+    if(pSec->isLcdOff)
+    {
+        XDBG_WARNING (MDRI2, "LCD OFF : Request a pageflip pending even if the lcd is off.\n");
+
+        _exchangeBuffers(pDraw, DRI2_FLIP, pEvent->pFrontBuf, pEvent->pBackBuf);
+
+        DRI2SwapComplete (pEvent->pClient, pDraw,
+                          0, 0, 0,
+                          0, pEvent->event_complete,
+                          pEvent->event_data);
+
+        pBackBufPriv->pFlipEvent = NULL;
+        _deleteFrame (pDraw, pEvent);
+        return TRUE;
+    }
+#ifdef LAYER_MANAGER
+    SECLayerPos lpos = secHwcGetDrawLpos (pDraw);
+    if (pSec->hwc_use_def_layer)
+    {
+        SECLayerPos p_lpos[5];
+        int max_lpos =  secLayerMngGetListOfOwnedPos(lyr_client_id, 0, p_lpos);
+        lpos = p_lpos[max_lpos - 1];
+    }
+    if (lpos == LAYER_NONE)
+    {
+        XDBG_WARNING (MDRI2, "Drawable(0x%x) was deleted from hwc\n", (unsigned int)pDraw->id);
+        goto fail;
+    }
+
+    if (pBackBufPriv->pFlipEvent)
+    {
+        if (pBackBufPriv->pFlipEvent->pPendingEvent)
+        {
+            XDBG_ERROR(MDRI2, "Pending event is exist\n");
+            goto fail;
+        }
+        if (pBackBufPriv->num_buf < 2)
+        {
+            XDBG_ERROR(MDRI2, "Pending event is exist\n");
+            goto fail;
+        }
+
+        pBackBufPriv->pFlipEvent->pPendingEvent = pEvent;
+        XDBG_TRACE (MDRI2,"FrameEvent(%d,0x%x) set to pending SwapType:%d "
+                    "Front(attach:%d, name:%d, flag:0x%x), Back(attach:%d, name:%d, flag:0x%x)\n",
+                    pDraw->type, (unsigned int)pDraw->id, pEvent->type,
+                    pEvent->pFrontBuf->attachment, pEvent->pFrontBuf->name, pEvent->pFrontBuf->flags,
+                    pEvent->pBackBuf->attachment, pEvent->pBackBuf->name, pEvent->pBackBuf->flags);
+        return TRUE;
+    }
+
+    vbuf = secUtilCreateVideoBufferByDraw ((DrawablePtr)pBackBufPriv->pPixmap);
+    XDBG_GOTO_IF_FAIL(vbuf != NULL, fail);
+    vbuf->vblank_handler = secDri2LayerFlipEventHandler;
+    vbuf->vblank_user_data = pEvent;
+    secHwcSetDriFlag (pDraw, TRUE);
+    XDBG_GOTO_IF_FAIL (
+            secLayerMngSet (lyr_client_id, 0, 0, NULL, NULL, NULL, vbuf, 0, lpos,
+                            NULL, NULL), fail);
+#else
+    SECLayerPtr pLayer = NULL;
+    pLayer = secLayerFindByDraw (pDraw);
+    XDBG_GOTO_IF_FAIL(pLayer != NULL, fail);
+    if (pLayer == NULL)
+    {
+        XDBG_WARNING (MDRI2, "Drawable(0x%x) was deleted from hwc\n", (unsigned int)pDraw->id);
+        goto fail;
+    }
+
+    if (pBackBufPriv->pFlipEvent)
+    {
+        if (pBackBufPriv->pFlipEvent->pPendingEvent)
+        {
+            XDBG_ERROR(MDRI2, "Pending event is exist\n");
+            goto fail;
+        }
+        if (pBackBufPriv->num_buf == 1)
+        {
+            XDBG_ERROR(MDRI2, "Pending event is exist\n");
+            goto fail;
+        }
+        pBackBufPriv->pFlipEvent->pPendingEvent = pEvent;
+        XDBG_TRACE (MDRI2,"FrameEvent(%d,0x%x) set to pending SwapType:%d "
+                    "Front(attach:%d, name:%d, flag:0x%x), Back(attach:%d, name:%d, flag:0x%x)\n",
+                    pDraw->type, (unsigned int)pDraw->id, pEvent->type,
+                    pEvent->pFrontBuf->attachment, pEvent->pFrontBuf->name, pEvent->pFrontBuf->flags,
+                    pEvent->pBackBuf->attachment, pEvent->pBackBuf->name, pEvent->pBackBuf->flags);
+        return TRUE;
+    }
+    vbuf = secUtilCreateVideoBufferByDraw ((DrawablePtr)pBackBufPriv->pPixmap);
+    XDBG_GOTO_IF_FAIL(vbuf != NULL, fail);
+
+    secLayerFreezeUpdate (pLayer, FALSE);
+    secLayerEnableVBlank (pLayer, TRUE);
+    secLayerUpdateDRI(pLayer, TRUE);
+    vbuf->vblank_handler = secDri2LayerFlipEventHandler;
+    vbuf->vblank_user_data = pEvent;
+    XDBG_GOTO_IF_FAIL (secLayerSetBuffer (pLayer, vbuf), fail);
+#endif
+
+    secUtilVideoBufferUnref (vbuf); //do unref for vbuf because vbuf is local variable
+    _exchangeBuffers (pDraw, DRI2_FLIP, pEvent->pFrontBuf, pEvent->pBackBuf);
+    pBackBufPriv->pFlipEvent = pEvent;
+
+    if (pBackBufPriv->num_buf > 1)
+    {
+        DRI2SwapComplete (pEvent->pClient, pDraw, 0, 0, 0, 0,
+                          pEvent->event_complete, pEvent->event_data);
+    }
+    return TRUE;
+fail:
+    if (vbuf)
+        secUtilFreeVideoBuffer(vbuf);
+    XDBG_WARNING(MDRI2, "fail to FLIP. Do blit\n");
+    _blitBuffers(pDraw, pEvent->pFrontBuf, pEvent->pBackBuf);
+    DRI2SwapComplete (pEvent->pClient, pDraw,
+                  0, 0, 0,
+                  0, pEvent->event_complete,
+                  pEvent->event_data);
+
+    XDBG_TRACE( MDRI2,"FrameEvent(%d,0x%x) SwapType:%d Front(attach:%d, name:%d, flag:0x%x), Back(attach:%d, name:%d, flag:0x%x)\n",
+                pDraw->type, (unsigned int)pDraw->id, pEvent->type,
+                pEvent->pFrontBuf->attachment, pEvent->pFrontBuf->name, pEvent->pFrontBuf->flags,
+                pEvent->pBackBuf->attachment, pEvent->pBackBuf->name, pEvent->pBackBuf->flags);
+
+    _deleteFrame(pDraw, pEvent);
+    return FALSE;
+}
 
 static Bool
 _scheduleFlip (DrawablePtr pDraw, DRI2FrameEventPtr pEvent, Bool bFlipChain)
@@ -1055,7 +1472,7 @@ _scheduleFlip (DrawablePtr pDraw, DRI2FrameEventPtr pEvent, Bool bFlipChain)
 }
 
 static void
-_saveDrawable (DrawablePtr pDraw, DRI2BufferPtr pBackBuf, DRI2FrameEventType swap_type)
+_saveDrawable (ClientPtr pClient, DrawablePtr pDraw, DRI2BufferPtr pBackBuf, DRI2FrameEventType swap_type)
 {
     ScreenPtr pScreen = pDraw->pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
@@ -1065,6 +1482,7 @@ _saveDrawable (DrawablePtr pDraw, DRI2BufferPtr pBackBuf, DRI2FrameEventType swa
     PixmapPtr pPix;
     DRI2BufferPrivPtr pBackBufPriv;
     SECPixmapPriv *pExaPixPriv;
+    char *appName = NULL;
 
     if (!pSec->dump_info)
         return;
@@ -1079,11 +1497,12 @@ _saveDrawable (DrawablePtr pDraw, DRI2BufferPtr pBackBuf, DRI2FrameEventType swa
     pExaPixPriv = exaGetPixmapDriverPrivate (pPix);
     XDBG_RETURN_IF_FAIL (pExaPixPriv != NULL);
 
-    snprintf (file, sizeof(file), "%03d_%s_%lx_%03d.%s",
-              pSec->flip_cnt, type[swap_type], pDraw->id, pExaPixPriv->dump_cnt,
+    appName = strrchr (GetClientCmdName (pClient), '/');
+    snprintf (file, sizeof(file), "%03d_%s_%s_%x_%03d.%s",
+              pSec->flip_cnt, type[swap_type], (appName?(++appName):("none")), (unsigned int)pDraw->id, pExaPixPriv->dump_cnt,
               pSec->dump_type);
 
-    if (!strcmp (pSec->dump_type, "raw"))
+    if (!strcmp (pSec->dump_type, DUMP_TYPE_RAW))
     {
         Bool need_finish = FALSE;
         SECPixmapPriv *privPixmap = exaGetPixmapDriverPrivate (pBackBufPriv->pPixmap);
@@ -1102,44 +1521,18 @@ _saveDrawable (DrawablePtr pDraw, DRI2BufferPtr pBackBuf, DRI2FrameEventType swa
             secExaFinishAccess (pBackBufPriv->pPixmap, EXA_PREPARE_DEST);
     }
     else
-        secUtilDoDumpPixmaps (pSec->dump_info, pBackBufPriv->pPixmap, file);
+        secUtilDoDumpPixmaps (pSec->dump_info, pBackBufPriv->pPixmap, file, pSec->dump_type);
 
     XDBG_DEBUG (MSEC, "dump done\n");
 
     pExaPixPriv->dump_cnt++;
 }
 
-static void
-_SendSyncDrawDoneMessage(ScreenPtr screen, ClientPtr client, DrawablePtr pDraw)
-{
-    XDBG_RETURN_IF_FAIL (screen != NULL);
-    XDBG_RETURN_IF_FAIL (client != NULL);
-    XDBG_RETURN_IF_FAIL (pDraw != NULL);
-
-    static Atom sync_draw_done = None;
-    xEvent event;
-    DeviceIntPtr dev = PickPointer(client);
-
-    if (sync_draw_done == None)
-        sync_draw_done = MakeAtom ("_E_COMP_SYNC_DRAW_DONE", strlen ("_E_COMP_SYNC_DRAW_DONE"), TRUE);
-
-    memset (&event, 0, sizeof (xEvent));
-    event.u.u.type = ClientMessage;
-    event.u.u.detail = 32;
-    event.u.clientMessage.u.l.type = sync_draw_done;
-    event.u.clientMessage.u.l.longs0 = pDraw->id; // window id
-    event.u.clientMessage.u.l.longs1 = 1; // version
-    event.u.clientMessage.u.l.longs2 = pDraw->width; // window's width
-    event.u.clientMessage.u.l.longs3 = pDraw->height; // window's height
-
-    XDBG_DEBUG(MDRI2, "client=%d pDraw->id=%x width=%d height=%d\n", client->index, pDraw->id, pDraw->width, pDraw->height);
-
-    DeliverEventsToWindow(dev, screen->root, &event, 1, SubstructureRedirectMask | SubstructureNotifyMask, NullGrab);
-}
-
 static DRI2BufferPtr
 SECDri2CreateBuffer (DrawablePtr pDraw, unsigned int attachment, unsigned int format)
 {
+    TTRACE_GRAPHICS_BEGIN("XORG:DRI2:CREATE_BUF");
+
     ScreenPtr pScreen = pDraw->pScreen;
     DRI2BufferPtr pBuf = NULL;
     DRI2BufferPrivPtr pBufPriv = NULL;
@@ -1210,14 +1603,15 @@ SECDri2CreateBuffer (DrawablePtr pDraw, unsigned int attachment, unsigned int fo
     pBufPriv->pPixmap = pPix;
     pBufPriv->pScreen = pScreen;
 
-    XDBG_DEBUG(MDRI2, "id:0x%x(%d) attach:%d, name:%d, flags:0x%x, flip:%d geo(%dx%d+%d+%d)\n",
+    XDBG_DEBUG(MDRI2, "id:0x%lx(%d) attach:%d, name:%d, flags:0x%x, flip:%d geo(%dx%d+%d+%d)\n",
                pDraw->id, pDraw->type,
                pBuf->attachment, pBuf->name, pBuf->flags, pBufPriv->canFlip,
                pDraw->width, pDraw->height, pDraw->x, pDraw->y);
 
+    TTRACE_GRAPHICS_END();
     return pBuf;
 fail:
-    XDBG_WARNING(MDRI2, "Failed: id:0x%x(%d) attach:%d,geo(%dx%d+%d+%d)\n",
+    XDBG_WARNING(MDRI2, "Failed: id:0x%lx(%d) attach:%d,geo(%dx%d+%d+%d)\n",
                  pDraw->id, pDraw->type, attachment, pDraw->width, pDraw->height, pDraw->x, pDraw->y);
     if (pPix)
     {
@@ -1230,17 +1624,25 @@ fail:
         free (pBufPriv);
     if (pBuf)
         free (pBuf);
+
+    TTRACE_GRAPHICS_END();
+
     return NULL;
 }
 
 static void
 SECDri2DestroyBuffer (DrawablePtr pDraw, DRI2BufferPtr pBuf)
 {
+    TTRACE_GRAPHICS_BEGIN("XORG:DRI2:DESTROY_BUF");
+
     ScreenPtr pScreen = NULL;
     DRI2BufferPrivPtr pBufPriv = NULL;
 
     if (pBuf == NULL)
+    {
+        TTRACE_GRAPHICS_END();
         return;
+    }
 
     pBufPriv = pBuf->driverPrivate;
     pScreen = pBufPriv->pScreen;
@@ -1268,12 +1670,16 @@ SECDri2DestroyBuffer (DrawablePtr pDraw, DRI2BufferPtr pBuf)
         free (pBufPriv);
         free (pBuf);
     }
+
+    TTRACE_GRAPHICS_END();
 }
 
 static void
 SECDri2CopyRegion (DrawablePtr pDraw, RegionPtr pRegion,
                    DRI2BufferPtr pDstBuf, DRI2BufferPtr pSrcBuf)
 {
+    TTRACE_GRAPHICS_BEGIN("XORG:DRI2:COPY_REGION");
+
     DRI2BufferPrivPtr pSrcBufPriv = pSrcBuf->driverPrivate;
     DRI2BufferPrivPtr pDstBufPriv = pDstBuf->driverPrivate;
     ScreenPtr pScreen = pDraw->pScreen;
@@ -1287,7 +1693,10 @@ SECDri2CopyRegion (DrawablePtr pDraw, RegionPtr pRegion,
 
     pGc = GetScratchGC (pDstDraw->depth, pScreen);
     if (!pGc)
+    {
+        TTRACE_GRAPHICS_END();
         return;
+    }
 
     XDBG_DEBUG(MDRI2,"CopyRegion(%d,0x%x) Dst(attach:%d, name:%d, flag:0x%x), Src(attach:%d, name:%d, flag:0x%x)\n",
                pDraw->type, (unsigned int)pDraw->id,
@@ -1319,6 +1728,8 @@ SECDri2CopyRegion (DrawablePtr pDraw, RegionPtr pRegion,
                            0, 0);
     (*pGc->funcs->DestroyClip) (pGc);
     FreeScratchGC (pGc);
+
+    TTRACE_GRAPHICS_END();
 }
 
 
@@ -1348,6 +1759,8 @@ SECDri2ScheduleSwapWithRegion (ClientPtr pClient, DrawablePtr pDraw,
                      CARD64 *target_msc, CARD64 divisor,    CARD64 remainder,
                      DRI2SwapEventPtr swap_func, void *data, RegionPtr pRegion)
 {
+    TTRACE_GRAPHICS_BEGIN("XORG:DRI2:SWAP_WITH_REGION");
+
     ScreenPtr pScreen = pDraw->pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
     SECPtr pSec = SECPTR (pScrn);
@@ -1362,6 +1775,8 @@ SECDri2ScheduleSwapWithRegion (ClientPtr pClient, DrawablePtr pDraw,
     if (!pFrameEvent)
     {
         DRI2SwapComplete (pClient, pDraw, 0, 0, 0, 0, swap_func, data);
+
+        TTRACE_GRAPHICS_END();
         return TRUE;
     }
 
@@ -1372,7 +1787,6 @@ SECDri2ScheduleSwapWithRegion (ClientPtr pClient, DrawablePtr pDraw,
         DRI2BufferPrivPtr pBufPriv = pBackBuf->driverPrivate;
         CARD64 sbc;
         unsigned int pending;
-
         pPix = pBufPriv->pBackPixmaps[pBufPriv->cur_idx];
         pExaPixPriv = exaGetPixmapDriverPrivate (pPix);
         DRI2GetSBC(pDraw, &sbc, &pending);
@@ -1383,14 +1797,24 @@ SECDri2ScheduleSwapWithRegion (ClientPtr pClient, DrawablePtr pDraw,
 
     swap_type = pFrameEvent->type;
 
-    XDBG_DEBUG (MSEC, "dump_mode(%x) dump_xid(0x%x:0x%x) swap_type(%d)\n",
+    XDBG_DEBUG (MSEC, "dump_mode(%x) dump_xid(0x%lx:0x%lx) swap_type(%d)\n",
                 pSec->dump_mode, pSec->dump_xid, pDraw->id, swap_type);
 
     if ((pSec->dump_mode & XBERC_DUMP_MODE_DRAWABLE) &&
         (swap_type != DRI2_NONE && swap_type != DRI2_WAITMSC) &&
         (pSec->dump_xid == 0 || pSec->dump_xid == pDraw->id))
-        _saveDrawable (pDraw, pBackBuf, swap_type);
+        _saveDrawable (pClient, pDraw, pBackBuf, swap_type);
 
+#ifdef NO_CRTC_MODE
+    if (pSec->isCrtcOn == FALSE)
+    {
+        _asyncSwapBuffers (pClient, pDraw, pFrameEvent);
+        _deleteFrame (pDraw, pFrameEvent);
+        TTRACE_GRAPHICS_END();
+        return TRUE;
+    }
+    else
+#endif //NO_CRTC_MODE
     /* If lcd is off status, SwapBuffers do not consider the vblank sync.
      * The client that launches after lcd is off wants to render the frame
      * on the fly.
@@ -1399,24 +1823,27 @@ SECDri2ScheduleSwapWithRegion (ClientPtr pClient, DrawablePtr pDraw,
         pSec->useAsyncSwap == TRUE)
     {
         _asyncSwapBuffers (pClient, pDraw, pFrameEvent);
-        _SendSyncDrawDoneMessage(pScreen, pClient, pDraw);
         _deleteFrame (pDraw, pFrameEvent);
+        TTRACE_GRAPHICS_END();
         return TRUE;
     }
 
-    pipe = secDisplayDrawablePipe (pDraw);
-
-    /* check if the pipe is -1 */
-    if (pipe == -1)
+    if (!pSec->hwc_active)
     {
-        /* if swap_type is DRI2_FLIP, fall into the async swap */
-        if (swap_type == DRI2_FLIP)
+        pipe = secDisplayDrawablePipe (pDraw);
+
+        /* check if the pipe is -1 */
+        if (pipe == -1)
         {
-            XDBG_WARNING(MDRI2, "Warning: flip pipe is -1 \n");
-            _asyncSwapBuffers (pClient, pDraw, pFrameEvent);
-            _SendSyncDrawDoneMessage(pScreen, pClient, pDraw);
-            _deleteFrame (pDraw, pFrameEvent);
-            return TRUE;
+            /* if swap_type is DRI2_FLIP, fall into the async swap */
+            if (swap_type == DRI2_FLIP)
+            {
+                XDBG_WARNING(MDRI2, "Warning: flip pipe is -1 \n");
+                _asyncSwapBuffers (pClient, pDraw, pFrameEvent);
+                _deleteFrame (pDraw, pFrameEvent);
+                TTRACE_GRAPHICS_END();
+                return TRUE;
+            }
         }
     }
 
@@ -1491,8 +1918,8 @@ SECDri2ScheduleSwapWithRegion (ClientPtr pClient, DrawablePtr pDraw,
         }
 
         _swapFrame (pDraw, pFrameEvent);
-        _SendSyncDrawDoneMessage(pScreen, pClient, pDraw);
 
+        TTRACE_GRAPHICS_END();
         return TRUE;
     }
 
@@ -1536,8 +1963,8 @@ SECDri2ScheduleSwapWithRegion (ClientPtr pClient, DrawablePtr pDraw,
                pBackBuf->attachment, pBackBuf->name, pBackBuf->flags);
 
     _swapFrame (pDraw, pFrameEvent);
-    _SendSyncDrawDoneMessage(pScreen, pClient, pDraw);
 
+    TTRACE_GRAPHICS_END();
     return TRUE;
 
 blit_fallback:
@@ -1550,13 +1977,15 @@ blit_fallback:
     _blitBuffers (pDraw, pFrontBuf, pBackBuf);
 
     DRI2SwapComplete (pClient, pDraw, 0, 0, 0, DRI2_BLIT_COMPLETE, swap_func, data);
-    _SendSyncDrawDoneMessage(pScreen, pClient, pDraw);
 
     if (pFrameEvent)
     {
         _deleteFrame (pDraw, pFrameEvent);
     }
     *target_msc = 0; /* offscreen, so zero out target vblank count */
+
+    TTRACE_GRAPHICS_END();
+
     return TRUE;
 }
 
@@ -1707,6 +2136,8 @@ SECDri2AuthMagic (int fd, uint32_t magic)
 static void
 SECDri2ReuseBufferNotify (DrawablePtr pDraw, DRI2BufferPtr pBuf)
 {
+    TTRACE_GRAPHICS_BEGIN("XORG:DRI2:REUSE_BUF_NOTIFY");
+
     DRI2BufferPrivPtr pBufPriv = pBuf->driverPrivate;
 
     if(!_resetBufPixmap(pDraw, pBuf))
@@ -1747,6 +2178,9 @@ SECDri2ReuseBufferNotify (DrawablePtr pDraw, DRI2BufferPtr pBuf)
             {
                 flags->data.idx_reuse = 0;
             }
+
+            /* [TODO] soolim: HACK::::: update the full region of the buffer */
+            flags->data.idx_reuse = 0;
         }
         else
         {
@@ -1754,14 +2188,16 @@ SECDri2ReuseBufferNotify (DrawablePtr pDraw, DRI2BufferPtr pBuf)
         }
     }
 
-    XDBG_DEBUG(MDRI2, "id:0x%x(%d) attach:%d, name:%d, flags:0x%x, flip:%d, geo(%dx%d+%d+%d)\n",
+    XDBG_DEBUG(MDRI2, "id:0x%lx(%d) attach:%d, name:%d, flags:0x%x, flip:%d, geo(%dx%d+%d+%d)\n",
                pDraw->id, pDraw->type,
                pBuf->attachment, pBuf->name, pBuf->flags, pBufPriv->canFlip,
                pDraw->width, pDraw->height, pDraw->x, pDraw->y);
+
+    TTRACE_GRAPHICS_END();
 }
 
-static void
-_secDri2ProcessPending (xf86CrtcPtr pCrtc, ScreenPtr pScreen,
+void
+secDri2ProcessPending (xf86CrtcPtr pCrtc,
                          unsigned int frame, unsigned int tv_sec, unsigned int tv_usec)
 {
     DRI2BufferPrivPtr pBackBufPriv = NULL;
@@ -1771,6 +2207,8 @@ _secDri2ProcessPending (xf86CrtcPtr pCrtc, ScreenPtr pScreen,
     pCrtcPendingFlip = secCrtcGetFirstPendingFlip (pCrtc);
     if (pCrtcPendingFlip)
     {
+        pBackBufPriv = pCrtcPendingFlip->pBackBuf->driverPrivate;
+        ScreenPtr pScreen = pBackBufPriv->pScreen;
         ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
         SECPtr pSec = SECPTR (pScrn);
 
@@ -1818,9 +2256,18 @@ void
 secDri2FlipEventHandler (unsigned int frame, unsigned int tv_sec,
                          unsigned int tv_usec, void *event_data, Bool flip_failed)
 {
+    TTRACE_GRAPHICS_BEGIN("XORG:DRI2:FLIP_HANDLER");
+
     DRI2FrameEventPtr pEvent = event_data;
+
+    if (event_data == NULL)
+    {
+        TTRACE_GRAPHICS_END();
+        XDBG_NEVER_GET_HERE(MDRI2);
+        return;
+    }
+
     DRI2BufferPrivPtr pBackBufPriv = pEvent->pBackBuf->driverPrivate;
-    ScreenPtr pScreen = pBackBufPriv->pScreen;
     DrawablePtr pDraw = NULL;
     ClientPtr pClient = pEvent->pClient;
     xf86CrtcPtr pCrtc = (xf86CrtcPtr) pEvent->pCrtc;
@@ -1834,8 +2281,10 @@ secDri2FlipEventHandler (unsigned int frame, unsigned int tv_sec,
                    pClient->index, pBackBufPriv->pipe,
                    pEvent->pFrontBuf->attachment, pEvent->pFrontBuf->name, pEvent->pFrontBuf->flags,
                    pEvent->pBackBuf->attachment, pEvent->pBackBuf->name, pEvent->pBackBuf->flags);
-        _secDri2ProcessPending (pCrtc, pScreen, frame, tv_sec, tv_usec);
+        secDri2ProcessPending (pCrtc, frame, tv_sec, tv_usec);
         _deleteFrame (pDraw, pEvent);
+
+        TTRACE_GRAPHICS_END();
         return;
     }
 
@@ -1853,6 +2302,9 @@ secDri2FlipEventHandler (unsigned int frame, unsigned int tv_sec,
         DRI2SwapComplete (pEvent->pClient, pDraw, frame, tv_sec, tv_usec,
                 0, pEvent->event_complete, pEvent->event_data);
         _deleteFrame (pDraw, pEvent);
+
+
+        TTRACE_GRAPHICS_END();
         return;
     }
 
@@ -1861,16 +2313,20 @@ secDri2FlipEventHandler (unsigned int frame, unsigned int tv_sec,
     _deleteFrame (pDraw, pEvent);
 
     /* get the next pending flip event */
-    _secDri2ProcessPending (pCrtc, pScreen, frame, tv_sec, tv_usec);
+    secDri2ProcessPending (pCrtc, frame, tv_sec, tv_usec);
 
+    TTRACE_GRAPHICS_END();
 }
 
 void
 secDri2FrameEventHandler (unsigned int frame, unsigned int tv_sec,
                           unsigned int tv_usec, void *event_data)
 {
+    TTRACE_GRAPHICS_BEGIN("XORG:DRI2:FRAME_HANDLER");
+
     DRI2FrameEventPtr pEvent = event_data;
     DrawablePtr pDraw = NULL;
+    ScrnInfoPtr pScrn;
     int status;
 
     status = dixLookupDrawable (&pDraw, pEvent->drawable_id, serverClient,
@@ -1880,8 +2336,12 @@ secDri2FrameEventHandler (unsigned int frame, unsigned int tv_sec,
         XDBG_WARNING(MDRI2,"drawable is not found\n");
 
         _deleteFrame (NULL, pEvent);
+
+        TTRACE_GRAPHICS_END();
         return;
     }
+
+    pScrn = xf86ScreenToScrn(pDraw->pScreen);
 
     XDBG_RETURN_IF_FAIL(pEvent->pFrontBuf != NULL);
     XDBG_RETURN_IF_FAIL(pEvent->pBackBuf != NULL);
@@ -1889,8 +2349,16 @@ secDri2FrameEventHandler (unsigned int frame, unsigned int tv_sec,
     switch (pEvent->type)
     {
     case DRI2_FLIP:
-        if(!_scheduleFlip (pDraw, pEvent, FALSE))
-            XDBG_WARNING(MDRI2, "pageflip fails.\n");
+        if(SECPTR(pScrn)->hwc_active) {
+            if(!_scheduleLayerFlip (pDraw, pEvent))
+                XDBG_WARNING(MDRI2, "set_layer fails.\n");
+        }
+        else
+        {
+            if(!_scheduleFlip (pDraw, pEvent, FALSE))
+                XDBG_WARNING(MDRI2, "pageflip fails.\n");
+        }
+        TTRACE_GRAPHICS_END();
         return;
         break;
     case DRI2_SWAP:
@@ -1919,8 +2387,8 @@ secDri2FrameEventHandler (unsigned int frame, unsigned int tv_sec,
                 pEvent->pFrontBuf->attachment, pEvent->pFrontBuf->name, pEvent->pFrontBuf->flags,
                 pEvent->pBackBuf->attachment, pEvent->pBackBuf->name, pEvent->pBackBuf->flags);
 
-
     _deleteFrame (pDraw, pEvent);
+    TTRACE_GRAPHICS_END();
 }
 
 
@@ -1976,6 +2444,12 @@ Bool secDri2Init (ScreenPtr pScreen)
 
     /* set the number of the flip back buffers */
     pExaPriv->flip_backbufs = pSec->flip_bufs - 1;
+
+    //TODO: Own client_id for layer manager
+#ifdef LAYER_MANAGER
+    if (lyr_client_id == 0)
+        lyr_client_id = secLayerMngRegisterClient (pScrn, "HWC", 1);
+#endif
 
     //xDbgLogSetLevel (MDRI2, 0);
     return ret;

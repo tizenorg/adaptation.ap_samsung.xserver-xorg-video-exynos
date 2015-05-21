@@ -48,7 +48,7 @@
 #include <xace.h>
 #include <xacestr.h>
 
-#include "exynos_drm.h"
+#include <exynos/exynos_drm.h>
 
 #include "sec.h"
 #include "sec_util.h"
@@ -75,8 +75,9 @@ enum
 
 enum
 {
-    STATUS_STARTED,
-    STATUS_STOPPED,
+    STATUS_RUNNING,
+    STATUS_PAUSE,
+    STATUS_STOP,
 };
 
 typedef struct _SECWbNotifyFuncInfo
@@ -149,7 +150,7 @@ static Atom atom_wb_rotate;
 static void _secWbQueue (SECWb *wb, int index);
 static Bool _secWbRegisterRotateHook (SECWb *wb, Bool hook);
 static void _secWbCloseDrmDstBuffer (SECWb *wb);
-static void _secWbCloseDrm (SECWb *wb);
+static void _secWbCloseDrm (SECWb *wb, Bool pause);
 
 static CARD32
 _secWbCountPrint (OsTimerPtr timer, CARD32 now, pointer arg)
@@ -253,6 +254,11 @@ _secWbLayerNotifyFunc (SECLayer *layer, int type, void *type_data, void *data)
     XDBG_RETURN_IF_FAIL (wb != NULL);
     XDBG_RETURN_IF_FAIL (VBUF_IS_VALID (vbuf));
 
+    if (wb->status == STATUS_PAUSE) {
+        XDBG_WARNING (MWB, "pause status. return.\n");
+        return;
+    }
+
     if (wb->wait_show >= 0 && wb->dst_buf[wb->wait_show] != vbuf)
         XDBG_WARNING (MWB, "wait_show(%d,%p) != showing_vbuf(%p). \n",
                       wb->wait_show, wb->dst_buf[wb->wait_show], vbuf);
@@ -351,7 +357,7 @@ _secWbQueue (SECWb *wb, int index)
     buf.buf_type = IPP_BUF_ENQUEUE;
     buf.prop_id = wb->prop_id;
     buf.buf_id = index;
-    buf.user_data = (__u64)(unsigned int)wb;
+    buf.user_data = (__u64)(uintptr_t)wb;
 
     for (j = 0; j < PLANAR_CNT; j++)
         buf.handle[j] = wb->dst_buf[index]->handles[j];
@@ -480,9 +486,10 @@ secWbHandleIppEvent (int fd, unsigned int *buf_idx, void *data)
         wb->event_timer = NULL;
     }
 
-    if (wb->status == STATUS_STOPPED)
+    if ((wb->status == STATUS_STOP) || (wb->status == STATUS_PAUSE))
     {
-        XDBG_ERROR (MWB, "stopped. ignore a event.\n", data);
+        XDBG_ERROR (MWB, "stop or pause. ignore a event. %p, (status:%d)\n",
+            data, wb->status);
         return;
     }
 
@@ -504,7 +511,7 @@ secWbHandleIppEvent (int fd, unsigned int *buf_idx, void *data)
         cur = GetTimeInMillis ();
         sub = cur - wb->prev_time;
         wb->prev_time = cur;
-        ErrorF ("wb evt interval  : %6ld ms\n", sub);
+        ErrorF ("wb evt interval  : %6"PRIXID" ms\n", sub);
     }
 
     if (pSec->wb_fps)
@@ -669,7 +676,9 @@ _secWbOpenDrm (SECWb *wb)
 #endif
     property.prop_id = wb->prop_id;
     property.refresh_rate = wb->hz;
+#ifdef LEGACY_INTERFACE
     property.protect = wb->secure;
+#endif
 
     wb->prop_id = secDrmIppSetProperty (wb->pScrn, &property);
     XDBG_GOTO_IF_FAIL (wb->prop_id >= 0, fail_to_open);
@@ -698,7 +707,7 @@ _secWbOpenDrm (SECWb *wb)
         buf.buf_type = IPP_BUF_ENQUEUE;
         buf.prop_id = wb->prop_id;
         buf.buf_id = i;
-        buf.user_data = (__u64)(unsigned int)wb;
+        buf.user_data = (__u64)(uintptr_t)wb;
 
         XDBG_GOTO_IF_FAIL (wb->dst_buf[i] != NULL, fail_to_open);
 
@@ -723,7 +732,7 @@ _secWbOpenDrm (SECWb *wb)
 
 fail_to_open:
 
-    _secWbCloseDrm (wb);
+    _secWbCloseDrm (wb, FALSE);
 
     _secWbCloseDrmDstBuffer (wb);
 
@@ -731,7 +740,7 @@ fail_to_open:
 }
 
 static void
-_secWbCloseDrm (SECWb *wb)
+_secWbCloseDrm (SECWb *wb, Bool pause)
 {
     struct drm_exynos_ipp_cmd_ctrl ctrl;
     int i;
@@ -740,7 +749,8 @@ _secWbCloseDrm (SECWb *wb)
 
     XDBG_TRACE (MWB, "now_showing(%d) \n", wb->now_showing);
 
-    if (wb->tv)
+    /* pause : remain displaying layer buffer */
+    if (wb->tv && !pause)
     {
         secVideoTvDisconnect (wb->tv);
         wb->tv = NULL;
@@ -760,12 +770,13 @@ _secWbCloseDrm (SECWb *wb)
         buf.buf_id = i;
 
         if (wb->dst_buf[i])
-            for (j = 0; j < EXYNOS_DRM_PLANAR_MAX && j < PLANAR_CNT; j++)
+            for (j = 0; j < EXYNOS_DRM_PLANAR_MAX; j++)
                 buf.handle[j] = wb->dst_buf[i]->handles[j];
 
-        secDrmIppQueueBuf (wb->pScrn, &buf);
+       secDrmIppQueueBuf (wb->pScrn, &buf);
 
-        wb->queued[i] = FALSE;
+       wb->queued[i] = FALSE;
+
     }
 
     CLEAR (ctrl);
@@ -919,7 +930,7 @@ secWbIsRunning (void)
     if (!keep_wb)
         return FALSE;
 
-    return (keep_wb->status == STATUS_STARTED) ? TRUE : FALSE;
+    return (keep_wb->status == STATUS_RUNNING) ? TRUE : FALSE;
 }
 
 SECWb*
@@ -962,7 +973,7 @@ _secWbOpen (ScrnInfoPtr pScrn, unsigned int id, int width, int height,
 
     keep_wb->width = width;
     keep_wb->height = height;
-    keep_wb->status = STATUS_STOPPED;
+    keep_wb->status = STATUS_STOP;
 
     keep_wb->scanout = scanout;
     keep_wb->hz = (hz > 0) ? hz : 60;
@@ -1025,7 +1036,7 @@ _secWbStart (SECWb *wb, const char *func)
         return FALSE;
     }
 
-    if (wb->status == STATUS_STARTED)
+    if (wb->status == STATUS_RUNNING)
         return TRUE;
 
     if (!_secWbOpenDrm (wb))
@@ -1034,7 +1045,7 @@ _secWbStart (SECWb *wb, const char *func)
         return FALSE;
     }
 
-    wb->status = STATUS_STARTED;
+    wb->status = STATUS_RUNNING;
 
     _secWbCallNotifyFunc (wb, WB_NOTI_START, NULL);
 
@@ -1048,7 +1059,7 @@ _secWbStop (SECWb *wb, Bool close_buf,const char *func)
 {
     XDBG_RETURN_IF_FAIL (wb != NULL);
 
-    if (wb->status == STATUS_STOPPED)
+    if ((wb->status == STATUS_STOP) || (wb->status == STATUS_PAUSE))
     {
         if (wb->rotate_timer)
         {
@@ -1058,18 +1069,59 @@ _secWbStop (SECWb *wb, Bool close_buf,const char *func)
         return;
     }
 
-    _secWbCloseDrm (wb);
+    _secWbCloseDrm (wb, FALSE);
 
     if (close_buf)
         _secWbCloseDrmDstBuffer (wb);
     else
         _secWbClearDrmDstBuffer (wb);
 
-    wb->status = STATUS_STOPPED;
+    wb->status = STATUS_STOP;
 
     _secWbCallNotifyFunc (wb, WB_NOTI_STOP, NULL);
 
     XDBG_TRACE (MWB, "stop: %s \n", func);
+}
+
+void
+secWbPause (SECWb *wb)
+{
+    XDBG_RETURN_IF_FAIL (wb != NULL);
+
+    if ((wb->status == STATUS_STOP) || (wb->status == STATUS_PAUSE))
+    {
+        if (wb->rotate_timer)
+        {
+            TimerFree (wb->rotate_timer);
+            wb->rotate_timer = NULL;
+        }
+        return;
+    }
+
+    _secWbCloseDrm (wb, TRUE);
+
+    _secWbCloseDrmDstBuffer (wb);
+
+    wb->status = STATUS_PAUSE;
+
+    _secWbCallNotifyFunc (wb, WB_NOTI_PAUSE, NULL);
+
+    XDBG_TRACE (MWB, "pause: %s, wb(%p)\n", __func__, wb);
+}
+
+void
+secWbResume (SECWb *wb)
+{
+    wb->wait_show = -1;
+    wb->now_showing = -1;
+
+    if (!secWbStart (wb))
+    {
+        XDBG_ERROR(MWB, "wb(%p) start fail.%s\n", wb, __func__);
+        secWbClose (wb);
+        wb = NULL;
+    }
+    XDBG_TRACE (MWB, "start: %s, wb(%p)\n", __func__, wb);
 }
 
 Bool
@@ -1078,7 +1130,7 @@ secWbSetBuffer (SECWb *wb, SECVideoBuf **vbufs, int bufnum)
     int i;
 
     XDBG_RETURN_VAL_IF_FAIL (wb != NULL, FALSE);
-    XDBG_RETURN_VAL_IF_FAIL (wb->status != STATUS_STARTED, FALSE);
+    XDBG_RETURN_VAL_IF_FAIL (wb->status != STATUS_RUNNING, FALSE);
     XDBG_RETURN_VAL_IF_FAIL (vbufs != NULL, FALSE);
     XDBG_RETURN_VAL_IF_FAIL (wb->buf_num <= bufnum, FALSE);
     XDBG_RETURN_VAL_IF_FAIL (bufnum <= WB_BUF_MAX, FALSE);
@@ -1138,7 +1190,7 @@ secWbSetRotate (SECWb *wb, int rotate)
 
     wb->rotate = rotate;
 
-    if (wb->status == STATUS_STARTED)
+    if (wb->status == STATUS_RUNNING)
     {
         SECModePtr pSecMode = (SECModePtr) SECPTR (wb->pScrn)->pSecMode;
 
@@ -1173,7 +1225,7 @@ secWbSetTvout (SECWb *wb, Bool enable)
 
     wb->tvout = enable;
 
-    if (wb->status == STATUS_STARTED)
+    if (wb->status == STATUS_RUNNING)
     {
         secWbStop (wb, FALSE);
 
@@ -1204,7 +1256,7 @@ secWbSetSecure (SECWb *wb, Bool secure)
 
     wb->secure = secure;
 
-    if (wb->status == STATUS_STARTED)
+    if (wb->status == STATUS_RUNNING)
     {
         secWbStop (wb, TRUE);
 

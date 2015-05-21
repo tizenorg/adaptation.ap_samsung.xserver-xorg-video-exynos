@@ -31,6 +31,11 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #ifndef SEC_H
 #define SEC_H
 
+#ifdef TEMP_D
+#define XV 1
+#define LAYER_MANAGER 1
+#endif
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -42,17 +47,63 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "xf86_OSproc.h"
 #include "xf86drm.h"
 #include "X11/Xatom.h"
+#include "sec.h"
 #include "tbm_bufmgr.h"
 #include "sec_display.h"
 #include "sec_accel.h"
 #include "sec_video.h"
 #include "sec_wb.h"
 #include "sec_util.h"
+#include "sec_hwc.h"
+#include "sec_hwa.h"
 #if HAVE_UDEV
 #include <libudev.h>
 #endif
 
-#define USE_XDBG 1
+#ifdef ENABLE_TTRACE
+#include <ttrace.h>
+#ifdef TTRACE_VIDEO_BEGIN
+#undef TTRACE_VIDEO_BEGIN
+#endif
+#ifdef TTRACE_VIDEO_END
+#undef TTRACE_VIDEO_END
+#endif
+#ifdef TTRACE_GRAPHICS_BEGIN
+#undef TTRACE_GRAPHICS_BEGIN
+#endif
+#ifdef TTRACE_GRAPHICS_END
+#undef TTRACE_GRAPHICS_END
+#endif
+#define TTRACE_VIDEO_BEGIN(NAME) traceBegin(TTRACE_TAG_VIDEO, NAME)
+#define TTRACE_VIDEO_END() traceEnd(TTRACE_TAG_VIDEO)
+
+#define TTRACE_GRAPHICS_BEGIN(NAME) traceBegin(TTRACE_TAG_GRAPHICS, NAME)
+#define TTRACE_GRAPHICS_END() traceEnd(TTRACE_TAG_GRAPHICS)
+#else
+#ifdef TTRACE_VIDEO_BEGIN
+#undef TTRACE_VIDEO_BEGIN
+#endif
+#ifdef TTRACE_VIDEO_END
+#undef TTRACE_VIDEO_END
+#endif
+#ifdef TTRACE_GRAPHICS_BEGIN(
+#undef TTRACE_GRAPHICS_BEGIN
+#endif
+#ifdef TTRACE_GRAPHICS_END
+#undef TTRACE_GRAPHICS_END
+#endif
+#define TTRACE_VIDEO_BEGIN(NAME)
+#define TTRACE_VIDEO_END()
+
+#define TTRACE_GRAPHICS_BEGIN(NAME)
+#define TTRACE_GRAPHICS_END()
+#endif
+
+#define USE_XDBG 0
+
+#define DUMP_TYPE_PNG "png"
+#define DUMP_TYPE_BMP "bmp"
+#define DUMP_TYPE_RAW "raw"
 
 /* drm bo data type */
 typedef enum
@@ -81,7 +132,7 @@ typedef struct
     SECFbPtr pFb;
     BoxRec pos;
     uint32_t gem_handle;
-    int fb_id;
+    intptr_t fb_id;
     int pitch;
     int size;
     PixmapPtr   pPixmap;
@@ -98,6 +149,8 @@ typedef struct
     OptionInfoPtr Options;
     Bool is_exa;
     Bool is_dri2;
+    Bool is_present;
+    Bool is_dri3;
     Bool is_sw_exa;
     Bool is_accel_2d;
     Bool is_wb_clone;
@@ -108,6 +161,11 @@ typedef struct
     Rotation rotate;
     Bool use_partial_update;
     Bool is_fb_touched; /* whether framebuffer is touched or not */
+
+    Bool use_hwc;
+    Bool use_setplane;
+    Bool use_flip;
+    Bool use_hwa;
 
     /* drm */
     int drm_fd;
@@ -126,8 +184,18 @@ typedef struct
     /* video private */
     SECVideoPrivPtr pVideoPriv;
 
+    /* HWC Compositor */
+    Bool hwc_active;
+    Bool hwc_use_def_layer;
+    SECHwcPtr pHwc;
+#ifdef LAYER_MANAGER
+    /* Layer Manager */
+    void *pLYRM;
+#endif
     Bool isLcdOff; /* lvds connector on/off status */
-
+#ifdef NO_CRTC_MODE
+    Bool isCrtcOn; /* Global crtc status */
+#endif
     /* screen wrapper functions */
     CloseScreenProcPtr CloseScreen;
     CreateScreenResourcesProcPtr CreateScreenResources;
@@ -185,6 +253,7 @@ typedef struct
        CREATE_PIXMAP_USAGE_FB
        CREATE_PIXMAP_USAGE_SUB_FB
        CREATE_PIXMAP_USAGE_DRI2_BACK
+       CREATE_PIXMAP_USAGE_DRI3_BACK
      */
     int pix_normal;
     int pix_backing_pixmap;
@@ -193,6 +262,11 @@ typedef struct
     int pix_fb;
     int pix_sub_fb;
     int pix_dri2_back;
+    int pix_dri3_back;
+
+   /* HWA */
+    int XVHIDE;
+
 } SECRec, *SECPtr;
 
 /* get a private screen of ScrnInfo */
@@ -209,8 +283,8 @@ typedef struct
 
 #define ROOT_FB_ADDR (~0UL)
 
-#define SEC_CURSOR_W 64
-#define SEC_CURSOR_H 64
+#define SEC_CURSOR_W 128
+#define SEC_CURSOR_H 128
 
 /* sec framebuffer */
 SECFbPtr      secFbAllocate      (ScrnInfoPtr pScrn, int width, int height);
@@ -222,6 +296,7 @@ tbm_bo    secFbFindBoByPoint (SECFbPtr pFb, int x, int y);
 tbm_bo    secFbSwapBo        (SECFbPtr pFb, tbm_bo back_bo);
 
 tbm_bo    secRenderBoCreate    (ScrnInfoPtr pScrn, int width, int height);
+int 	  secSwapToRenderBo	   (ScrnInfoPtr pScrn, int width, int height, tbm_bo carr_bo, Bool clear);
 tbm_bo    secRenderBoRef       (tbm_bo bo);
 void          secRenderBoUnref     (tbm_bo bo);
 void          secRenderBoSetPos    (tbm_bo bo, int x, int y);

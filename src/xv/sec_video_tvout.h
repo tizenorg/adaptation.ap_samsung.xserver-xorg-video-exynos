@@ -52,5 +52,9 @@ int         secVideoTvPutImage    (SECVideoTv *tv, SECVideoBuf *vbuf, xRectangle
 
 SECCvt*     secVideoTvGetConverter (SECVideoTv *tv);
 void        secVideoTvSetConvertFormat (SECVideoTv *tv, unsigned int convert_id);
+Bool        secVideoTvResizeOutput (SECVideoTv* tv, xRectanglePtr src, xRectanglePtr dst);
+Bool        secVideoTvCanDirectDrawing (SECVideoTv* tv, int src_w, int src_h, int dst_w, int dst_h);
+Bool        secVideoTvReCreateConverter (SECVideoTv* tv);
+Bool        secVideoTvSetAttributes(SECVideoTv* tv, int rotate, int hflip, int vflip);
 
 #endif /* __SEC_VIDEO_TVOUT_H__ */

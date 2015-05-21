@@ -35,7 +35,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <fbdevhw.h>
 #include <X11/Xdefs.h>
 #include <tbm_bufmgr.h>
-#include <exynos_drm.h>
+#include <exynos/exynos_drm.h>
 
 /* securezone memory */
 #define TZMEM_IOC_GET_TZMEM 0xC00C5402
@@ -148,7 +148,8 @@ typedef struct _SECVideoBuf
     Bool    dirty;
     Bool    need_reset;
 
-    unsigned int fb_id;      /* fb_id of vbuf */
+    intptr_t fb_id;      /* fb_id of vbuf */
+    Bool fb_id_external;     /* if fb_id was set from outside (not created in secUtilVideoSetFb) fb_id should't be removed */
 
     struct xorg_list free_funcs;
 
@@ -156,13 +157,18 @@ typedef struct _SECVideoBuf
     int     csc_range;
 
     struct xorg_list valid_link;   /* to check valid */
-    CARD32 stamp;
+    uintptr_t stamp;
     unsigned int ref_cnt;
     char   *func;
     int     flags;
     Bool    scanout;
 
     CARD32 put_time;
+
+    //showing complite event
+    void (*vblank_handler) (unsigned int frame, unsigned int tv_sec, unsigned int tv_usec,
+                            void *vblank_user_data, int failed);
+    void * vblank_user_data;
 } SECVideoBuf;
 
 #endif

@@ -46,7 +46,7 @@ typedef struct _secCrtcPriv
     SECModePtr pSecMode;
     drmModeModeInfo kmode;
     drmModeCrtcPtr mode_crtc;
-    int pipe;
+    intptr_t pipe;
 
     int idx;
     tbm_bo front_bo;
@@ -121,9 +121,13 @@ typedef struct _secCrtcPriv
     Bool onoff_always;
 
     xf86CrtcPtr pCrtc;
+    Bool is_dummy;
     struct xorg_list link;
 } SECCrtcPrivRec, *SECCrtcPrivPtr;
-
+#if 0
+xf86CrtcPtr    secCrtcDummyInit (ScrnInfoPtr pScrn);
+#endif
+Bool    secCrtcCheckInUseAll(ScrnInfoPtr pScrn);
 void    secCrtcInit  (ScrnInfoPtr pScrn, SECModePtr pSecMode, int num);
 Bool    secCrtcOn    (xf86CrtcPtr pCrtc);
 Bool    secCrtcApply (xf86CrtcPtr pCrtc);
@@ -158,6 +162,8 @@ void      secCrtcRelAllFlipPixmap (ScrnInfoPtr pScrn, int crtc_pipe);
 void      secCrtcRemoveFlipPixmap (xf86CrtcPtr pCrtc);
 
 void    secCrtcCountFps(xf86CrtcPtr pCrtc);
+
+xf86CrtcPtr secCrtcGetByID(ScrnInfoPtr pScrn, int crtc_id);
 
 static inline int
 secCrtcID(SECCrtcPrivPtr pCrtcPriv)
