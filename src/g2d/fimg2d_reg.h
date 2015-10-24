@@ -21,8 +21,8 @@
 */
 #define BITBLT_START_REG		(0x0100)
 #define BITBLT_COMMAND_REG	(0x0104)
-#define BLEND_FUNCTION_REG	(0x0108)	/* VER4.1 */
-#define ROUND_MODE_REG		(0x010C)	/* VER4.1 */
+#define BLEND_FUNCTION_REG	(0x0108)        /* VER4.1 */
+#define ROUND_MODE_REG		(0x010C)        /* VER4.1 */
 
 /*
 *       PARAMETER SETTING REGISTER
@@ -40,8 +40,8 @@
 #define SRC_COLOR_MODE_REG	(0x030c)
 #define SRC_LEFT_TOP_REG		(0x0310)
 #define SRC_RIGHT_BOTTOM_REG	(0x0314)
-#define SRC_PLANE2_BASE_ADDR_REG	(0x0318)	/* VER4.1 */
-#define SRC_REPEAT_MODE_REG		(0x031C)	
+#define SRC_PLANE2_BASE_ADDR_REG	(0x0318)        /* VER4.1 */
+#define SRC_REPEAT_MODE_REG		(0x031C)
 #define SRC_PAD_VALUE_REG			(0x0320)
 #define SRC_A8_RGB_EXT_REG			(0x0324)
 #define SRC_SCALE_CTRL_REG			(0x0328)
@@ -55,7 +55,7 @@
 #define DST_COLOR_MODE_REG	(0x040C)
 #define DST_LEFT_TOP_REG		(0x0410)
 #define DST_RIGHT_BOTTOM_REG	(0x0414)
-#define DST_PLANE2_BASE_ADDR_REG	(0x0418)	/* VER4.1 */
+#define DST_PLANE2_BASE_ADDR_REG	(0x0418)        /* VER4.1 */
 #define DST_A8_RGB_EXT_REG		(0x041C)
 
 /*	PATTERN	*/
@@ -68,9 +68,9 @@
 /*	MASK	*/
 #define MASK_BASE_ADDR_REG		(0x0520)
 #define MASK_STRIDE_REG		(0x0524)
-#define MASK_LEFT_TOP_REG		(0x0528)		/* VER4.1 */
-#define MASK_RIGHT_BOTTOM_REG	(0x052C)	/* VER4.1 */
-#define MASK_MODE_REG				(0x0530)	/* VER4.1 */
+#define MASK_LEFT_TOP_REG		(0x0528)        /* VER4.1 */
+#define MASK_RIGHT_BOTTOM_REG	(0x052C)        /* VER4.1 */
+#define MASK_MODE_REG				(0x0530)        /* VER4.1 */
 #define MASK_REPEAT_MODE_REG		(0x0534)
 #define MASK_PAD_VALUE_REG		(0x0538)
 #define MASK_SCALE_CTRL_REG		(0x053C)
@@ -96,7 +96,7 @@
 #define FG_COLOR_REG			(0x0700)
 #define BG_COLOR_REG			(0x0704)
 #define BS_COLOR_REG			(0x0708)
-#define SF_COLOR_REG			(0x070C)	/* VER4.1 */
+#define SF_COLOR_REG			(0x070C)        /* VER4.1 */
 
 /*
 *       COLOR KEY
@@ -108,13 +108,12 @@
 #define DST_COLORKEY_DR_MIN_REG	(0x0720)
 #define DST_COLORKEY_DR_MAX_REG	(0x0724)
 /*	YCbCr src Color Key	*/
-#define YCbCr_SRC_COLORKEY_CTRL_REG		(0x0728)	/* VER4.1 */
-#define YCbCr_SRC_COLORKEY_DR_MIN_REG	(0x072C)	/* VER4.1 */
-#define YCbCr_SRC_COLORKEY_DR_MAX_REG	(0x0730)	/* VER4.1 */
+#define YCbCr_SRC_COLORKEY_CTRL_REG		(0x0728)        /* VER4.1 */
+#define YCbCr_SRC_COLORKEY_DR_MIN_REG	(0x072C)        /* VER4.1 */
+#define YCbCr_SRC_COLORKEY_DR_MAX_REG	(0x0730)        /* VER4.1 */
 /*	YCbCr dst Color Key	*/
-#define YCbCr_DST_COLORKEY_CTRL_REG		(0x0734)	/* VER4.1 */
-#define YCbCr_DST_COLORKEY_DR_MIN_REG	(0x0738)	/* VER4.1 */
-#define YCbCr_DST_COLORKEY_DR_MAX_REG	(0x073C)	/* VER4.1 */
+#define YCbCr_DST_COLORKEY_CTRL_REG		(0x0734)        /* VER4.1 */
+#define YCbCr_DST_COLORKEY_DR_MIN_REG	(0x0738)        /* VER4.1 */
+#define YCbCr_DST_COLORKEY_DR_MAX_REG	(0x073C)        /* VER4.1 */
 
 #endif
-

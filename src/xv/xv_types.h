@@ -50,23 +50,22 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define XV_BUF_TYPE_LEGACY  1
 
 /* Data structure for XvPutImage / XvShmPutImage */
-typedef struct
-{
-    unsigned int _header; /* for internal use only */
-    unsigned int _version; /* for internal use only */
+typedef struct {
+    unsigned int _header;       /* for internal use only */
+    unsigned int _version;      /* for internal use only */
 
     unsigned int YBuf;
     unsigned int CbBuf;
     unsigned int CrBuf;
 
     unsigned int BufType;
-} XV_DATA, * XV_DATA_PTR;
+} XV_DATA, *XV_DATA_PTR;
 
 static void
 #ifdef __GNUC__
-__attribute__ ((unused))
+    __attribute__ ((unused))
 #endif
-XV_INIT_DATA (XV_DATA_PTR data)
+    XV_INIT_DATA(XV_DATA_PTR data)
 {
     data->_header = XV_DATA_HEADER;
     data->_version = XV_DATA_VERSION;
@@ -74,9 +73,9 @@ XV_INIT_DATA (XV_DATA_PTR data)
 
 static int
 #ifdef __GNUC__
-__attribute__ ((unused))
+    __attribute__ ((unused))
 #endif
-XV_VALIDATE_DATA (XV_DATA_PTR data)
+    XV_VALIDATE_DATA(XV_DATA_PTR data)
 {
     if (data->_header != XV_DATA_HEADER)
         return XV_HEADER_ERROR;

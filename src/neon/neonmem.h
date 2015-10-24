@@ -26,24 +26,22 @@ ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-**************************************************************************/
-
+**************************************************************************/  
+    
 #ifndef _NEON_MEMCPY_HEADER_
 #define _NEON_MEMCPY_HEADER_
-
+    
 #include <stddef.h>
-
+    
 #ifdef memcpy
 #undef memcpy
 #endif
-
+    
 #define memcpy memcpy_neon
+void *memcpy_neon(void *dst, const void *src, size_t count);
+ int move_pixels(void *bits, int bpp, int stride, int img_width,
+                    int img_height, int sx, int sy, int dx, int dy, int w,
+                    int h);
 
-void *
-memcpy_neon (void *dst, const void *src, size_t count);
-
-int
-move_pixels (void *bits, int bpp, int stride, int img_width, int img_height,
-             int sx, int sy, int dx, int dy, int w, int h);
-#endif /*  _NEON_MEMCPY_HEADER_ */
-
+#endif  /*  _NEON_MEMCPY_HEADER_ */
+    

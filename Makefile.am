@@ -19,4 +19,10 @@
 #  CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 AUTOMAKE_OPTIONS = foreign
-SUBDIRS = src man
+
+if ! HAVE_FT
+ SUBDIRS = src man
+else
+ SUBDIRS = tests/functional
+endif
+
